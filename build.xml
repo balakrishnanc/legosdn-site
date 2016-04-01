@@ -1,0 +1,189 @@
+<?xml version="1.0" encoding="utf-8"?>
+<project name="legosdn" default="dist" basedir=".">
+    <property name="src" location="src"/>
+    <property name="tests" location="tests"/>
+    <property name="build" location="build"/>
+    <property name="dist" location="dist"/>
+    <property name="docs" location="docs"/>
+    <property name="third.party" value="third-party"/>
+    <property name="external.apps" value="external-apps"/>
+
+    <property environment="env"/>
+    <property name="floodlight.home" value="${env.FLOODLIGHT_HOME}"/>
+    <property name="legosdn.home" value="${env.LEGOSDN_HOME}"/>
+
+    <property name="legosdn.main" value="edu.duke.cs.legosdn.appvisor.stub.AppLoader"/>
+    <property name="legosdn.core.jar" value="${dist}/legosdn-core.jar"/>
+    <property name="legosdn.tools.jar" value="${dist}/legosdn-tools.jar"/>
+    <property name="legosdn.tests.jar" value="${dist}/legosdn-tests.jar"/>
+
+    <patternset id="floodlight-core-lib">
+        <include name="floodlight.core.jar"/>
+    </patternset>
+
+    <patternset id="logging-lib">
+        <include name="log4j-1.2.9.jar"/>
+        <include name="slf4j-api-1.6.4.jar"/>
+    </patternset>
+
+    <patternset id="third-party-libs">
+        <include name="fst-2.01.jar"/>
+        <include name="protobuf-java-2.6.0.jar"/>
+    </patternset>
+
+    <patternset id="application.jars">
+        <include name="*.jar"/>
+    </patternset>
+
+    <path id="core.build.deps.path">
+        <fileset dir="${floodlight.home}/dist">
+            <patternset refid="floodlight-core-lib"/>
+        </fileset>
+        <fileset dir="${floodlight.home}/lib">
+            <patternset refid="logging-lib"/>
+        </fileset>
+        <fileset dir="${legosdn.home}/${third.party}">
+            <patternset refid="third-party-libs"/>
+        </fileset>
+    </path>
+
+    <path id="tests.build.deps.path">
+        <path refid="core.build.deps.path"/>
+        <file name="${legosdn.core.jar}"/>
+    </path>
+
+    <path id="runtime.deps.path">
+        <path refid="core.build.deps.path"/>
+        <file name="${legosdn.core.jar}"/>
+        <file name="${legosdn.tests.jar}"/>
+    </path>
+    <property name="runtime.deps" refid="runtime.deps.path"/>
+
+    <target name="init">
+        <tstamp/>
+        <mkdir dir="${build}"/>
+    </target>
+
+    <target name="build.core"
+            depends="init"
+            description="Build the core">
+        <javac srcdir="${src}" destdir="${build}"
+               debug="on"
+               debuglevel="lines,vars,source"
+               includeantruntime="false"
+               classpathref="core.build.deps.path">
+            <compilerarg value="-Xlint:deprecation,unchecked"/>
+        </javac>
+    </target>
+
+    <target name="build.tests"
+            depends="init"
+            description="Build the tests">
+        <javac srcdir="${tests}" destdir="${build}"
+               debug="on"
+               debuglevel="lines,vars,source"
+               includeantruntime="false"
+               classpathref="tests.build.deps.path">
+            <compilerarg value="-Xlint:deprecation,unchecked"/>
+        </javac>
+    </target>
+
+    <target name="build"
+            depends="init,build.core,build.tests"
+            description="Build the core and tests">
+    </target>
+
+    <target name="rebuild"
+            depends="clean,build"
+            description="Rebuild all sources">
+    </target>
+
+    <target name="dist.core"
+            depends="build"
+            description="Generate a distribution of the core">
+        <manifest file="MANIFEST.MF">
+            <attribute name="Built-By" value="${user.name}"/>
+            <attribute name="Main-Class" value="${legosdn.main}"/>
+        </manifest>
+        <jar jarfile="${legosdn.core.jar}"
+             manifest="MANIFEST.MF"
+             basedir="${build}"
+             includes="edu/duke/cs/legosdn/core/**/*.class">
+            <zipgroupfileset dir="${legosdn.home}/${external.apps}">
+                <patternset refid="application.jars"/>
+            </zipgroupfileset>
+        </jar>
+    </target>
+
+    <target name="dist.tools"
+            depends="build"
+            description="Generate a distribution of the tools">
+        <manifest file="MANIFEST.MF">
+            <attribute name="Built-By" value="${user.name}"/>
+            <attribute name="Main-Class" value="${legosdn.main}"/>
+        </manifest>
+        <jar jarfile="${legosdn.tools.jar}"
+             manifest="MANIFEST.MF"
+             basedir="${build}"
+             includes="edu/duke/cs/legosdn/tools/**/*.class">
+          <fileset dir="${build}"
+                   includes="edu/duke/cs/legosdn/util/**/*.class"/>
+        </jar>
+    </target>
+
+    <target name="dist.tests"
+            depends="build"
+            description="Generate a distribution of the tests">
+        <manifest file="MANIFEST.MF">
+            <attribute name="Built-By" value="${user.name}"/>
+            <attribute name="Main-Class" value="${legosdn.main}"/>
+        </manifest>
+        <jar jarfile="${legosdn.tests.jar}"
+             manifest="MANIFEST.MF"
+             basedir="${build}"
+             includes="edu/duke/cs/legosdn/tests/**/*.class">
+        </jar>
+    </target>
+
+    <target name="dist"
+            depends="build,dist.core,dist.tools,dist.tests"
+            description="Generate a distribution of the tests">
+    </target>
+
+    <target name="clean"
+            description="Remove distribution and build artifacts">
+        <antcall target="clean.build"/>
+        <antcall target="clean.dist"/>
+    </target>
+
+    <target name="clean.build"
+            description="Clean up build artifacts">
+        <delete dir="${build}"/>
+    </target>
+
+    <target name="clean.dist.core"
+            description="Remove core distribution jar">
+        <delete file="${legosdn.core.jar}"/>
+    </target>
+
+    <target name="clean.dist.tests"
+            description="Remove tests distribution jar">
+        <delete file="${legosdn.tests.jar}"/>
+    </target>
+
+    <target name="clean.dist"
+            depends="clean.dist.core,clean.dist.tests"
+            description="Remove distribution jars">
+    </target>
+
+    <target name="run" depends="dist">
+        <java classname="${legosdn.main}"
+              classpathref="runtime.deps.path"
+              fork="true"
+              failonerror="true"
+              maxmemory="2048m">
+            <arg value="${ctrl.application.name}"/>
+        </java>
+    </target>
+
+</project>

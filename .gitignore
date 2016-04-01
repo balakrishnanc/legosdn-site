@@ -1,0 +1,8 @@
+.idea/
+build/
+dist/
+sandbox/
+SyncDB/
+*.iml
+*.properties
+MANIFEST.MF

@@ -1,0 +1,2 @@
+Drop SDN application JARs to be run within LegoSDN here.
+FloodLight modules file still needs to be manually updated to load the application.

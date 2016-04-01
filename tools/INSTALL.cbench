@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Installs cbench  on the target machine.
+# Assumes the machine on which the install script is called has 'apt-get'.
+
+cd /opt
+sudo apt-get install autoconf automake libtool libsnmp-dev libpcap-dev git
+git clone git://gitosis.stanford.edu/oflops.git
+cd oflops; git submodule init && git submodule update
+git clone git://gitosis.stanford.edu/openflow.git
+cd openflow; git checkout -b release/1.0.0 remotes/origin/release/1.0.0
+wget http://hyperrealm.com/libconfig/libconfig-1.4.9.tar.gz
+tar -xvzf libconfig-1.4.9.tar.gz
+cd libconfig-1.4.9
+./configure
+sudo make && sudo make install
+cd ../../netfpga-packet-generator-c-library/
+sudo ./autogen.sh && sudo ./configure && sudo make
+cd ..
+sh ./boot.sh ; ./configure --with-openflow-src-dir=/opt/oflops/openflow; make
+sudo make install
+cd cbench
