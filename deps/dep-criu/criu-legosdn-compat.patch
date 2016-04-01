@@ -1,0 +1,2198 @@
+From e5835fbc49af470478403da4c5cb1fc3a47b05cf Mon Sep 17 00:00:00 2001
+From: Bala Chandrasekaran <balakrishnan.c@gmail.com>
+Date: Tue, 7 Oct 2014 04:18:01 -0400
+Subject: [PATCH 1/6] Disable UID check (insecure checkpoint).
+
+---
+ cr-service.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/cr-service.c b/cr-service.c
+index 9be69f8..0812746 100644
+--- a/cr-service.c
++++ b/cr-service.c
+@@ -179,8 +179,10 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
+ 		return -1;
+ 	}
+ 
++	/*/
+ 	if (restrict_uid(ids.uid, ids.gid))
+ 		return -1;
++	//*/
+ 
+ 	if (fstat(sk, &st)) {
+ 		pr_perror("Can't get socket stat");
+-- 
+1.9.1
+
+
+From 803aa642107e41e1a5714be0449fbb4d3e72d670 Mon Sep 17 00:00:00 2001
+From: Bala Chandrasekaran <balakrishnan.c@gmail.com>
+Date: Sat, 13 Dec 2014 17:45:17 -0500
+Subject: [PATCH 2/6] Add hacks to support TCP/UDP services.
+
+---
+ cr-service.c               | 390 ++++++++++++++++++++++++++++++++++++++++++++-
+ crtools.c                  |   9 ++
+ include/cr-service-const.h |   4 +
+ include/cr-service.h       |   2 +
+ 4 files changed, 397 insertions(+), 8 deletions(-)
+
+diff --git a/cr-service.c b/cr-service.c
+index 0812746..f7b3664 100644
+--- a/cr-service.c
++++ b/cr-service.c
+@@ -12,6 +12,8 @@
+ #include <sys/un.h>
+ #include <sys/wait.h>
+ #include <sys/stat.h>
++#include <netdb.h>
++#include <time.h>
+ 
+ #include "crtools.h"
+ #include "cr_options.h"
+@@ -27,6 +29,7 @@
+ #include "cgroup.h"
+ 
+ unsigned int service_sk_ino = -1;
++static unsigned int chkpt_num = 0;
+ 
+ static int recv_criu_msg(int socket_fd, CriuReq **msg)
+ {
+@@ -54,6 +57,28 @@ static int recv_criu_msg(int socket_fd, CriuReq **msg)
+ 	return 0;
+ }
+ 
++static int load_criu_msg(const unsigned char *buf, int buf_len, CriuReq **msg)
++{
++	if (buf_len == -1) {
++		pr_perror("Can't read request");
++		return -1;
++	}
++
++	if (buf_len == 0) {
++		pr_info("Client exited unexpectedly\n");
++		errno = ECONNRESET;
++		return -1;
++	}
++
++	*msg = criu_req__unpack(NULL, buf_len, buf);
++	if (!*msg) {
++		pr_perror("Failed unpacking request");
++		return -1;
++	}
++
++	return 0;
++}
++
+ static int send_criu_msg(int socket_fd, CriuResp *msg)
+ {
+ 	unsigned char buf[CR_MAX_MSG_SIZE];
+@@ -167,6 +192,8 @@ int send_criu_rpc_script(char *script, int fd)
+ 
+ static int setup_opts_from_req(int sk, CriuOpts *req)
+ {
++	const char *output_base_path = "/legosdn/checkpoints";
++	char output_dir[256];
+ 	struct ucred ids;
+ 	struct stat st;
+ 	socklen_t ids_len = sizeof(struct ucred);
+@@ -179,6 +206,8 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
+ 		return -1;
+ 	}
+ 
++	// NOTE: Security checks based on the caller's UID or GID will fail,
++	//  unless UNIX sockets with the SOCK_SEQPACKET protocol is used.
+ 	/*/
+ 	if (restrict_uid(ids.uid, ids.gid))
+ 		return -1;
+@@ -192,8 +221,35 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
+ 	BUG_ON(st.st_ino == -1);
+ 	service_sk_ino = st.st_ino;
+ 
++	/* Since caller is not communicating over SOCK_SEQPACKET
++	 * protocol, caller cannot pass on the file handle for the output
++	 * directory. Hence, calle (the CRIU service) creates the destination
++	 * directory and populates the request options with the file handle.
++	 *
++	 * NOTE: This presents some serious security risks if caller
++	 * is NOT TRUST WORTHY.
++	 */
++	/* Incremental dumps, as indicated by the number in the end of the path. */
++	sprintf(output_dir, "%s/%d", output_base_path, chkpt_num);
++	if (mkdir(output_dir, S_IREAD | S_IWRITE) < 0) {
++		pr_perror("Failed to create output path %s!", output_dir);
++		return -1;
++	}
++	printf("> DUMP %d\n", chkpt_num);
++	int fd = open(output_dir, O_RDONLY);
++	if (fd < 0) {
++		pr_perror("Can't open dir %s", output_dir);
++		return -1;
++	}
++	req->images_dir_fd = fd;
++
++	int cr_srvc_pid = getpid();
++
+ 	/* open images_dir */
+-	sprintf(images_dir_path, "/proc/%d/fd/%d", ids.pid, req->images_dir_fd);
++	/* sprintf(images_dir_path, "/proc/%d/fd/%d",
++	   ids.pid, req->images_dir_fd); */
++	sprintf(images_dir_path, "/proc/%d/fd/%d",
++		cr_srvc_pid, req->images_dir_fd);
+ 
+ 	if (req->parent_img)
+ 		opts.img_parent = req->parent_img;
+@@ -205,7 +261,8 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
+ 
+ 	/* chdir to work dir */
+ 	if (req->has_work_dir_fd)
+-		sprintf(work_dir_path, "/proc/%d/fd/%d", ids.pid, req->work_dir_fd);
++		/* sprintf(work_dir_path, "/proc/%d/fd/%d", ids.pid, req->work_dir_fd); */
++		sprintf(work_dir_path, "/proc/%d/fd/%d", cr_srvc_pid, req->work_dir_fd);
+ 	else
+ 		strcpy(work_dir_path, images_dir_path);
+ 
+@@ -411,7 +468,7 @@ static int check(int sk)
+ 
+ 	/* Check only minimal kernel support */
+ 	opts.check_ms_kernel = true;
+-
++	
+ 	if (!cr_check())
+ 		resp.success = true;
+ 
+@@ -518,6 +575,14 @@ out:
+ int cr_service_work(int sk)
+ {
+ 	CriuReq *msg = 0;
++	int ret = 0;
++	int tset;
++	struct timespec tbeg, tend;
++
++	if ((tset = clock_gettime(CLOCK_MONOTONIC, &tbeg)) == -1) {
++		perror("cr_udp_service> failed to retrieve time!");
++		exit(1);
++	}
+ 
+ 	if (recv_criu_msg(sk, &msg) == -1) {
+ 		pr_perror("Can't recv request");
+@@ -526,21 +591,90 @@ int cr_service_work(int sk)
+ 
+ 	switch (msg->type) {
+ 	case CRIU_REQ_TYPE__DUMP:
+-		return dump_using_req(sk, msg->opts);
++		ret = dump_using_req(sk, msg->opts);
++		break;
+ 	case CRIU_REQ_TYPE__RESTORE:
+-		return restore_using_req(sk, msg->opts);
++		ret = restore_using_req(sk, msg->opts);
++		break;
+ 	case CRIU_REQ_TYPE__CHECK:
+-		return check(sk);
++		ret = check(sk);
++		break;
+ 	case CRIU_REQ_TYPE__PRE_DUMP:
+-		return pre_dump_loop(sk, msg);
++		ret = pre_dump_loop(sk, msg);
++		break;
+ 	case CRIU_REQ_TYPE__PAGE_SERVER:
+-		return start_page_server_req(sk, msg->opts);
++		ret = start_page_server_req(sk, msg->opts);
++		break;
+ 
+ 	default:
+ 		send_criu_err(sk, "Invalid req");
+ 		goto err;
+ 	}
+ 
++	if ((tset == 0) &&
++	    ((tset = clock_gettime(CLOCK_MONOTONIC, &tend)) == -1)) {
++		perror("cr_udp_service> failed to retrieve time!");
++		exit(1);
++	}
++			
++	if (tset == 0) {
++		double ms = (tend.tv_sec - tbeg.tv_sec) * 1000.0;
++		ms += (tend.tv_nsec - tbeg.tv_nsec) / 1000000.0;
++
++		switch (msg->type) {
++		case CRIU_REQ_TYPE__DUMP:
++			printf("CRIU_REQ_TYPE__DUMP");
++			break;
++		case CRIU_REQ_TYPE__RESTORE:
++			printf("CRIU_REQ_TYPE__RESTORE");
++			break;
++		case CRIU_REQ_TYPE__CHECK:
++			printf("CRIU_REQ_TYPE__CHECK");
++			break;
++		case CRIU_REQ_TYPE__PRE_DUMP:
++			printf("CRIU_REQ_TYPE__PRE_DUMP");
++			break;
++		case CRIU_REQ_TYPE__PAGE_SERVER:
++			printf("CRIU_REQ_TYPE__PAGE_SERVER");
++			break;
++		default:
++			printf("UNKNOWN");
++		}
++		printf("  %.4fms\n", ms);
++	}
++
++	return ret;
++
++err:
++	return -1;
++}
++
++int cr_service_work_from_buf(int cli_sock, const unsigned char *buf, int buf_len)
++{
++	CriuReq *msg = 0;
++
++	if (load_criu_msg(buf, buf_len, &msg) == -1) {
++		pr_perror("Can't recv request");
++		goto err;
++	}
++
++	switch (msg->type) {
++	case CRIU_REQ_TYPE__DUMP:
++		return dump_using_req(cli_sock, msg->opts);
++	case CRIU_REQ_TYPE__RESTORE:
++		return restore_using_req(cli_sock, msg->opts);
++	case CRIU_REQ_TYPE__CHECK:
++		return check(cli_sock);
++	case CRIU_REQ_TYPE__PRE_DUMP:
++		return pre_dump_loop(cli_sock, msg);
++	case CRIU_REQ_TYPE__PAGE_SERVER:
++		return start_page_server_req(cli_sock, msg->opts);
++
++	default:
++		send_criu_err(cli_sock, "Invalid req");
++		goto err;
++	}
++
+ err:
+ 	return -1;
+ }
+@@ -721,3 +855,243 @@ err:
+ 
+ 	return 1;
+ }
++
++int cr_tcp_service(bool daemon_mode)
++{
++	int srv_sock;
++	struct addrinfo hints, *srv_info, *p;
++	int yes = 1;
++
++	int cli_sock;
++	struct sockaddr_storage cli_addr;
++	socklen_t cli_addr_sz;
++
++	int child_pid;
++	int rv;
++
++	memset(&hints, 0, sizeof hints);
++	hints.ai_family = AF_INET;
++	hints.ai_socktype = SOCK_STREAM;
++	hints.ai_flags = AI_PASSIVE;
++
++	if ((rv = getaddrinfo(CR_DEF_SRVC_ADDR, CR_DEF_SRVC_PORT,
++			      &hints, &srv_info)) != 0) {
++		fprintf(stderr, "cr_tcp_service> failed in 'getaddrinfo'; %s\n",
++			gai_strerror(rv));
++		goto err;
++	}
++
++	/* Bind to the first result. */
++	for (p = srv_info; p != NULL; p = p->ai_next) {
++		if ((srv_sock = socket(p->ai_family,
++				       p->ai_socktype,
++				       p->ai_protocol)) == -1) {
++			perror("cr_tcp_service> failed to create socket");
++			continue;
++		}
++
++		if (setsockopt(srv_sock, SOL_SOCKET, SO_REUSEADDR,
++			       &yes, sizeof(int)) == -1) {
++			perror("cr_tcp_service> failed to set socket options");
++			continue;
++		}
++
++		if (bind(srv_sock, p->ai_addr, p->ai_addrlen) == -1) {
++			close(srv_sock);
++			perror("cr_tcp_service> failed to bind socket.");
++			continue;
++		}
++
++		break;
++	}
++	
++	if (p == NULL) {
++		fprintf(stderr, "cr_tcp_service> failed to bind!\n");
++		goto err;
++	}
++
++	freeaddrinfo(srv_info);
++
++	if (listen(srv_sock, CR_DEF_SRVC_BACKLOG) == -1) {
++		perror("cr_tcp_service> failed to listen on socket.");
++		goto err;
++	}
++
++	if (setup_sigchld_handler()) {
++		fprintf(stderr, "cr_tcp_service> failed to setup SIGCHLD handler.\n");
++		goto err;
++	}
++
++	if (daemon_mode) {
++		if (daemon(1, 0) == -1) {
++			pr_perror("cr_tcp_service> cannot run service server in the background");
++			goto err;
++		}
++	}
++
++	/* printf("cr_tcp_service> initialized and running ...\n"); */
++
++	while(1) {
++		chkpt_num += 1;
++		cli_addr_sz = sizeof cli_addr;
++		cli_sock = accept(srv_sock, (struct sockaddr *) &cli_addr, &cli_addr_sz);
++		if (cli_sock == -1) {
++			perror("cr_tcp_service> failed to accept connection");
++			continue;
++		}
++
++		if ((child_pid = fork()) == 0) {
++			int ret;
++
++			if (restore_sigchld_handler()) {
++				exit(1);
++			}
++
++			/* NOTE: Server socket is not required in child. */
++			close(srv_sock);
++
++			init_opts();
++			ret = cr_service_work(cli_sock);
++
++			close(cli_sock);
++
++			exit(ret != 0);
++		}
++
++		if (child_pid < 0) {
++			fprintf(stderr, "cr_tcp_service> failed to fork connection handler.");
++
++			close(srv_sock);
++			goto err;
++		}
++
++		/* NOTE: Client socket is not required in parent. */
++		close(cli_sock);
++	}
++	
++err:
++	return 1;
++}
++
++int cr_udp_service(bool daemon_mode)
++{
++	int srv_sock;
++	struct addrinfo hints, *srv_info, *p;
++	int yes = 1;
++
++	struct sockaddr_storage cli_addr;
++	socklen_t cli_addr_sz;
++	unsigned char buf[CR_MAX_MSG_SIZE];
++	int buf_len;
++
++	int child_pid;
++	int rv;
++
++	memset(&hints, 0, sizeof hints);
++	hints.ai_family = AF_INET;
++	hints.ai_socktype = SOCK_DGRAM;
++	hints.ai_flags = AI_PASSIVE;
++
++	if ((rv = getaddrinfo(CR_DEF_SRVC_ADDR, CR_DEF_SRVC_PORT,
++			      &hints, &srv_info)) != 0) {
++		fprintf(stderr, "cr_udp_service> failed in 'getaddrinfo'; %s\n",
++			gai_strerror(rv));
++		goto err;
++	}
++
++	/* Bind to the first result. */
++	for (p = srv_info; p != NULL; p = p->ai_next) {
++		if ((srv_sock = socket(p->ai_family,
++				       p->ai_socktype,
++				       p->ai_protocol)) == -1) {
++			perror("cr_udp_service> failed to create socket");
++			continue;
++		}
++
++		if (setsockopt(srv_sock, SOL_SOCKET, SO_REUSEADDR,
++			       &yes, sizeof(int)) == -1) {
++			perror("cr_udp_service> failed to set socket options");
++			continue;
++		}
++
++		if (bind(srv_sock, p->ai_addr, p->ai_addrlen) == -1) {
++			close(srv_sock);
++			perror("cr_udp_service> failed to bind socket.");
++			continue;
++		}
++
++		break;
++	}
++	
++	if (p == NULL) {
++		fprintf(stderr, "cr_udp_service> failed to bind!\n");
++		goto err;
++	}
++
++	freeaddrinfo(srv_info);
++
++	if (setup_sigchld_handler()) {
++		fprintf(stderr, "cr_udp_service> failed to setup SIGCHLD handler.\n");
++		goto err;
++	}
++
++	if (daemon_mode) {
++		if (daemon(1, 0) == -1) {
++			pr_perror("cr_udp_service> cannot run service server in the background");
++			goto err;
++		}
++	}
++
++	printf("cr_udp_service> initialized and running ...\n");
++
++	while(1) {
++		cli_addr_sz = sizeof cli_addr;
++		buf_len = recvfrom(srv_sock, buf, CR_MAX_MSG_SIZE-1, 0,
++				   (struct sockaddr *) &cli_addr, &cli_addr_sz);
++
++		if ((child_pid = fork()) == 0) {
++			int cli_sock;
++			int ret;
++
++			/* NOTE: Server socket is not required in child. */
++			close(srv_sock);
++
++			if (restore_sigchld_handler()) {
++				exit(1);
++			}
++
++			if ((cli_sock = socket(AF_INET, SOCK_DGRAM, 17)) == -1) {
++				perror("cr_udp_service> failed to create socket to connect to caller");
++				exit(1);
++			}
++			
++			if (setsockopt(cli_sock, SOL_SOCKET, SO_REUSEADDR,
++				       &yes, sizeof(int)) == -1) {
++				perror("cr_udp_service> failed to set socket options");
++				exit(1);
++			}
++
++			if (connect(cli_sock, (struct sockaddr *) &cli_addr, cli_addr_sz) == -1) {
++				perror("cr_udp_service> failed to connect to caller");
++				exit(1);
++			}
++
++			init_opts();
++			ret = cr_service_work_from_buf(cli_sock, buf, buf_len);
++
++			close(cli_sock);
++
++			exit(ret != 0);
++		}
++
++		if (child_pid < 0) {
++			fprintf(stderr, "cr_udp_service> failed to fork connection handler.");
++
++			close(srv_sock);
++			goto err;
++		}
++	}
++	
++err:
++	return 1;
++}
+diff --git a/crtools.c b/crtools.c
+index 1412b1f..fc9a1c1 100644
+--- a/crtools.c
++++ b/crtools.c
+@@ -511,6 +511,12 @@ int main(int argc, char *argv[])
+ 	if (!strcmp(argv[optind], "service"))
+ 		return cr_service(opts.restore_detach);
+ 
++	if (!strcmp(argv[optind], "tcp-service"))
++		return cr_tcp_service(opts.restore_detach);
++
++	if (!strcmp(argv[optind], "udp-service"))
++		return cr_udp_service(opts.restore_detach);
++
+ 	if (!strcmp(argv[optind], "dedup"))
+ 		return cr_dedup() != 0;
+ 
+@@ -525,6 +531,7 @@ usage:
+ "  criu exec -p PID <syscall-string>\n"
+ "  criu page-server\n"
+ "  criu service [<options>]\n"
++"  criu tcp-service [<options>]\n"
+ "  criu dedup\n"
+ "\n"
+ "Commands:\n"
+@@ -536,6 +543,8 @@ usage:
+ "  exec           execute a system call by other task\n"
+ "  page-server    launch page server\n"
+ "  service        launch service\n"
++"  tcp-service    launch TCP service\n"
++"  udp-service    launch TCP service\n"
+ "  dedup          remove duplicates in memory dump\n"
+ 	);
+ 
+diff --git a/include/cr-service-const.h b/include/cr-service-const.h
+index 668882b..974d4e4 100644
+--- a/include/cr-service-const.h
++++ b/include/cr-service-const.h
+@@ -4,4 +4,8 @@
+ #define CR_MAX_MSG_SIZE 1024
+ #define CR_DEFAULT_SERVICE_ADDRESS "/var/run/criu_service.socket"
+ 
++#define CR_DEF_SRVC_ADDR "127.0.0.1"
++#define CR_DEF_SRVC_PORT "9080"
++#define CR_DEF_SRVC_BACKLOG 4
++
+ #endif /* __CR_SERVICE_CONST_H__ */
+diff --git a/include/cr-service.h b/include/cr-service.h
+index eadc0c3..da4928e 100644
+--- a/include/cr-service.h
++++ b/include/cr-service.h
+@@ -4,6 +4,8 @@
+ #include "protobuf/rpc.pb-c.h"
+ 
+ extern int cr_service(bool deamon_mode);
++extern int cr_tcp_service(bool deamon_mode);
++extern int cr_udp_service(bool deamon_mode);
+ int cr_service_work(int sk);
+ 
+ extern int send_criu_dump_resp(int socket_fd, bool success, bool restored);
+-- 
+1.9.1
+
+
+From 95d210c2e0d9feeefbce67cdd91aa553c4516160 Mon Sep 17 00:00:00 2001
+From: Bala Chandrasekaran <balac@cs.duke.edu>
+Date: Mon, 2 Mar 2015 18:58:59 -0500
+Subject: [PATCH 3/6] Port changes from 1.4 to 1.3.
+
+---
+ cr-service.c               | 362 ++++++++++++++++++++-------------------------
+ crtools.c                  |   8 +-
+ image.c                    |  13 +-
+ include/cr-service.h       |  17 ++-
+ launch-criu-tcp-service.sh |  32 ++++
+ 5 files changed, 222 insertions(+), 210 deletions(-)
+ create mode 100755 launch-criu-tcp-service.sh
+
+diff --git a/cr-service.c b/cr-service.c
+index f7b3664..9186cd2 100644
+--- a/cr-service.c
++++ b/cr-service.c
+@@ -13,7 +13,6 @@
+ #include <sys/wait.h>
+ #include <sys/stat.h>
+ #include <netdb.h>
+-#include <time.h>
+ 
+ #include "crtools.h"
+ #include "cr_options.h"
+@@ -29,7 +28,9 @@
+ #include "cgroup.h"
+ 
+ unsigned int service_sk_ino = -1;
+-static unsigned int chkpt_num = 0;
++static unsigned long chkpt_num = 0;
++
++static int restore_sigchld_handler();
+ 
+ static int recv_criu_msg(int socket_fd, CriuReq **msg)
+ {
+@@ -192,23 +193,67 @@ int send_criu_rpc_script(char *script, int fd)
+ 
+ static int setup_opts_from_req(int sk, CriuOpts *req)
+ {
+-	const char *output_base_path = "/legosdn/checkpoints";
+-	char output_dir[256];
+-	struct ucred ids;
++	const char *output_base_path = CHKPT_DUMP_BASE_DIR;
++	char output_dir[CHKPT_DUMP_PATH_MAX_LEN];
++	char parent_dir[CHKPT_DUMP_PATH_MAX_LEN];
++	/* struct ucred ids; */
+ 	struct stat st;
+-	socklen_t ids_len = sizeof(struct ucred);
++	/* socklen_t ids_len = sizeof(struct ucred); */
+ 	char images_dir_path[PATH_MAX];
+ 	char work_dir_path[PATH_MAX];
+ 	int i;
+ 
++	/* Last available checkpoint. */
++	unsigned long last_available = FULL_CHKPT_FREQ * (chkpt_num / FULL_CHKPT_FREQ);
++	if (last_available == 0) last_available = SAFE_CHKPT_NUM;
++
++	/* printf("> last-available checkpoint: %lu\n", last_available); */
++
++	if ((chkpt_num % FULL_CHKPT_FREQ) == 0) {
++		if (fork() == 0) {
++			/* Cleanup process. */
++			char clear_cmd[CHKPT_CLEAR_CMD_LEN];
++			unsigned long old_chkpt_num = chkpt_num - 1;
++			unsigned long last_remaining = FULL_CHKPT_FREQ * (old_chkpt_num / FULL_CHKPT_FREQ);
++			int ret = 0;
++
++			/* if (restore_sigchld_handler()) { */
++			/* 	exit(1); */
++			/* } */
++
++			/* NOTE: Client socket is not required in child. */
++			// close(sk);
++
++			while (old_chkpt_num >= last_remaining) {
++				/* NOTE: Use path of last successful checkpoint. */
++				sprintf(clear_cmd, "sudo rm -rf %s/%lu", output_base_path, old_chkpt_num);
++
++				ret |= system(clear_cmd);
++
++				old_chkpt_num--;
++			}
++
++			exit(ret != 0);
++		}
++	}
++
++	/*
++	 * NOTE: SO_PEERCRED only applies to sockets in the Unix domain.
++	 * Since, LegoSDN cannot talk to CRIU over Unix sockets,
++	 * disable this call to avoid issues.
++	 */
++	/*/
+ 	if (getsockopt(sk, SOL_SOCKET, SO_PEERCRED, &ids, &ids_len)) {
+ 		pr_perror("Can't get socket options");
+ 		return -1;
+ 	}
++	//*/
+ 
+-	// NOTE: Security checks based on the caller's UID or GID will fail,
+-	//  unless UNIX sockets with the SOCK_SEQPACKET protocol is used.
+-	/*/
++	/*
++	 * NOTE: Security checks based on the caller's UID or GID will fail,
++	 * unless UNIX sockets with the SOCK_SEQPACKET protocol is used.
++	 */
++        /*/
+ 	if (restrict_uid(ids.uid, ids.gid))
+ 		return -1;
+ 	//*/
+@@ -221,41 +266,101 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
+ 	BUG_ON(st.st_ino == -1);
+ 	service_sk_ino = st.st_ino;
+ 
+-	/* Since caller is not communicating over SOCK_SEQPACKET
++	/*
++	 * Since caller is not communicating over SOCK_SEQPACKET
+ 	 * protocol, caller cannot pass on the file handle for the output
+-	 * directory. Hence, calle (the CRIU service) creates the destination
++	 * directory. Hence, callee (the CRIU service) creates the destination
+ 	 * directory and populates the request options with the file handle.
+ 	 *
+ 	 * NOTE: This presents some serious security risks if caller
+ 	 * is NOT TRUST WORTHY.
+ 	 */
+-	/* Incremental dumps, as indicated by the number in the end of the path. */
+-	sprintf(output_dir, "%s/%d", output_base_path, chkpt_num);
+-	if (mkdir(output_dir, S_IREAD | S_IWRITE) < 0) {
+-		pr_perror("Failed to create output path %s!", output_dir);
+-		return -1;
+-	}
+-	printf("> DUMP %d\n", chkpt_num);
+-	int fd = open(output_dir, O_RDONLY);
+-	if (fd < 0) {
+-		pr_perror("Can't open dir %s", output_dir);
+-		return -1;
++
++	int fd = -1;
++        /* Incremental dumps, as indicated by the number in the end of the path. */
++	if (opts.restore_detach) {
++                /* NOTE: Use last successful checkpoint. */
++		chkpt_num--;
++
++                /* printf("> RESTORE %lu\n", chkpt_num); */
++
++                /* NOTE: Use path of last successful checkpoint. */
++		sprintf(output_dir, "%s/%lu", output_base_path, chkpt_num);
++
++		while (/* chkpt_num >= last_available */ chkpt_num >= SAFE_CHKPT_NUM) {
++			fd = open(output_dir, O_RDONLY);
++			if (fd < 0) {
++				pr_perror("Can't open prior checkpoint %s", output_dir);
++			} else {
++                                /* printf("> using prior checkpoint path %s\n", output_dir); */
++				break;
++			}
++
++                        /* Check for an earlier checkpoint */
++			chkpt_num--;
++			sprintf(output_dir, "%s/%lu", output_base_path, chkpt_num);
++		}
++
++		if (fd < 0) {
++			pr_perror("Failed to find a checkpoint to restore from!");
++			return -1;
++		}
++	} else {
++		/* printf("> DUMP %lu\n", chkpt_num); */
++
++		sprintf(output_dir, "%s/%lu", output_base_path, chkpt_num);
++
++                /* Since caller is not communicating over SOCK_SEQPACKET
++		 * protocol, caller cannot pass on the file handle for the output
++		 * directory. Hence, calle (the CRIU service) creates the destination
++		 * directory and populates the request options with the file handle.
++		 *
++		 * NOTE: This presents some serious security risks if caller
++		 * is NOT TRUST WORTHY.
++		 */
++		if (mkdir(output_dir, S_IREAD | S_IWRITE) < 0) {
++			pr_perror("Failed to create output path %s!", output_dir);
++			return -1;
++		}
++
++		fd = open(output_dir, O_RDONLY);
++		if (fd < 0) {
++			pr_perror("Can't open output path %s", output_dir);
++			return -1;
++		}
++
++		unsigned long prev_chkpt_num = chkpt_num - 1;
++		while ((chkpt_num > SAFE_CHKPT_NUM) &&
++		       (prev_chkpt_num >= last_available)) {
++			sprintf(parent_dir, "%s/%lu", output_base_path, prev_chkpt_num);
++
++			int pd = open(parent_dir, O_RDONLY);
++			if (pd < 0) {
++				pr_perror("Can't open prior checkpoint path %s", parent_dir);
++			} else {
++                                /* printf("> using prior checkpoint path %s\n", parent_dir); */
++				close(pd);
++				break;
++			}
++
++                        /* Check for an earlier checkpoint */
++			prev_chkpt_num--;
++			sprintf(parent_dir, "%s/%lu", output_base_path, prev_chkpt_num);
++		}
+ 	}
+ 	req->images_dir_fd = fd;
+ 
+ 	int cr_srvc_pid = getpid();
+ 
+-	/* open images_dir */
+-	/* sprintf(images_dir_path, "/proc/%d/fd/%d",
+-	   ids.pid, req->images_dir_fd); */
+-	sprintf(images_dir_path, "/proc/%d/fd/%d",
+-		cr_srvc_pid, req->images_dir_fd);
++        /* open images_dir */
++        /* sprintf(images_dir_path, "/proc/%d/fd/%d", ids.pid, req->images_dir_fd); */
++	sprintf(images_dir_path, "/proc/%d/fd/%d", cr_srvc_pid, req->images_dir_fd);
+ 
+ 	if (req->parent_img)
+ 		opts.img_parent = req->parent_img;
+ 
+ 	if (open_image_dir(images_dir_path) < 0) {
+-		pr_perror("Can't open images directory");
++		pr_perror("Can't open images directory '%s'", images_dir_path);
+ 		return -1;
+ 	}
+ 
+@@ -292,9 +397,14 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
+ 	if (req->has_leave_running && req->leave_running)
+ 		opts.final_state = TASK_ALIVE;
+ 
++	/*
++	 * NOTE: Request must have a PID set.
++	 */
+ 	if (!req->has_pid) {
+-		req->has_pid = true;
+-		req->pid = ids.pid;
++		/* req->has_pid = true; */
++		/* req->pid = ids.pid; */
++		pr_perror("Dump request has no PID set!");
++		return -1;
+ 	}
+ 
+ 	if (req->has_ext_unix_sk)
+@@ -327,6 +437,8 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
+ 	if (req->has_track_mem)
+ 		opts.track_mem = req->track_mem;
+ 
++	/* printf("> track_mem? %c\n", req->has_track_mem ? 'Y' : 'N'); */
++
+ 	if (req->has_link_remap)
+ 		opts.link_remap_ok = req->link_remap;
+ 
+@@ -352,8 +464,10 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
+ 		struct script *script;
+ 
+ 		script = xmalloc(sizeof(struct script));
+-		if (script == NULL)
++		if (script == NULL) {
++			pr_perror("Failed at 'xmalloc (context: notify_scripts)'!");
+ 			return -1;
++		}
+ 
+ 		script->path = SCRIPT_RPC_NOTIFY;
+ 		script->arg = sk;
+@@ -361,19 +475,25 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
+ 	}
+ 
+ 	for (i = 0; i < req->n_veths; i++) {
+-		if (veth_pair_add(req->veths[i]->if_in, req->veths[i]->if_out))
++		if (veth_pair_add(req->veths[i]->if_in, req->veths[i]->if_out)) {
++			pr_perror("Failed at 'veth_pair_add'!");
+ 			return -1;
++		}
+ 	}
+ 
+ 	for (i = 0; i < req->n_ext_mnt; i++) {
+-		if (ext_mount_add(req->ext_mnt[i]->key, req->ext_mnt[i]->val))
++		if (ext_mount_add(req->ext_mnt[i]->key, req->ext_mnt[i]->val)) {
++			pr_perror("Failed at 'ext_mount_add'!");
+ 			return -1;
++		}
+ 	}
+ 
+ 	for (i = 0; i < req->n_cg_root; i++) {
+ 		if (new_cg_root_add(req->cg_root[i]->ctrl,
+-					req->cg_root[i]->path))
++				    req->cg_root[i]->path)) {
++			pr_perror("Failed at 'new_cg_root_add'!");
+ 			return -1;
++		}
+ 	}
+ 
+ 	if (req->has_cpu_cap)
+@@ -576,13 +696,6 @@ int cr_service_work(int sk)
+ {
+ 	CriuReq *msg = 0;
+ 	int ret = 0;
+-	int tset;
+-	struct timespec tbeg, tend;
+-
+-	if ((tset = clock_gettime(CLOCK_MONOTONIC, &tbeg)) == -1) {
+-		perror("cr_udp_service> failed to retrieve time!");
+-		exit(1);
+-	}
+ 
+ 	if (recv_criu_msg(sk, &msg) == -1) {
+ 		pr_perror("Can't recv request");
+@@ -611,38 +724,6 @@ int cr_service_work(int sk)
+ 		goto err;
+ 	}
+ 
+-	if ((tset == 0) &&
+-	    ((tset = clock_gettime(CLOCK_MONOTONIC, &tend)) == -1)) {
+-		perror("cr_udp_service> failed to retrieve time!");
+-		exit(1);
+-	}
+-			
+-	if (tset == 0) {
+-		double ms = (tend.tv_sec - tbeg.tv_sec) * 1000.0;
+-		ms += (tend.tv_nsec - tbeg.tv_nsec) / 1000000.0;
+-
+-		switch (msg->type) {
+-		case CRIU_REQ_TYPE__DUMP:
+-			printf("CRIU_REQ_TYPE__DUMP");
+-			break;
+-		case CRIU_REQ_TYPE__RESTORE:
+-			printf("CRIU_REQ_TYPE__RESTORE");
+-			break;
+-		case CRIU_REQ_TYPE__CHECK:
+-			printf("CRIU_REQ_TYPE__CHECK");
+-			break;
+-		case CRIU_REQ_TYPE__PRE_DUMP:
+-			printf("CRIU_REQ_TYPE__PRE_DUMP");
+-			break;
+-		case CRIU_REQ_TYPE__PAGE_SERVER:
+-			printf("CRIU_REQ_TYPE__PAGE_SERVER");
+-			break;
+-		default:
+-			printf("UNKNOWN");
+-		}
+-		printf("  %.4fms\n", ms);
+-	}
+-
+ 	return ret;
+ 
+ err:
+@@ -874,14 +955,14 @@ int cr_tcp_service(bool daemon_mode)
+ 	hints.ai_socktype = SOCK_STREAM;
+ 	hints.ai_flags = AI_PASSIVE;
+ 
+-	if ((rv = getaddrinfo(CR_DEF_SRVC_ADDR, CR_DEF_SRVC_PORT,
++	if ((rv = getaddrinfo(TCP_SRVC_ADDR, TCP_SRVC_PORT,
+ 			      &hints, &srv_info)) != 0) {
+ 		fprintf(stderr, "cr_tcp_service> failed in 'getaddrinfo'; %s\n",
+ 			gai_strerror(rv));
+ 		goto err;
+ 	}
+ 
+-	/* Bind to the first result. */
++        /* Bind to the first result. */
+ 	for (p = srv_info; p != NULL; p = p->ai_next) {
+ 		if ((srv_sock = socket(p->ai_family,
+ 				       p->ai_socktype,
+@@ -912,7 +993,7 @@ int cr_tcp_service(bool daemon_mode)
+ 
+ 	freeaddrinfo(srv_info);
+ 
+-	if (listen(srv_sock, CR_DEF_SRVC_BACKLOG) == -1) {
++	if (listen(srv_sock, TCP_SRVC_BACKLOG) == -1) {
+ 		perror("cr_tcp_service> failed to listen on socket.");
+ 		goto err;
+ 	}
+@@ -932,7 +1013,6 @@ int cr_tcp_service(bool daemon_mode)
+ 	/* printf("cr_tcp_service> initialized and running ...\n"); */
+ 
+ 	while(1) {
+-		chkpt_num += 1;
+ 		cli_addr_sz = sizeof cli_addr;
+ 		cli_sock = accept(srv_sock, (struct sockaddr *) &cli_addr, &cli_addr_sz);
+ 		if (cli_sock == -1) {
+@@ -940,6 +1020,9 @@ int cr_tcp_service(bool daemon_mode)
+ 			continue;
+ 		}
+ 
++		chkpt_num += 1;
++		/* printf("> #requests: %lu\n", chkpt_num); */
++
+ 		if ((child_pid = fork()) == 0) {
+ 			int ret;
+ 
+@@ -953,6 +1036,8 @@ int cr_tcp_service(bool daemon_mode)
+ 			init_opts();
+ 			ret = cr_service_work(cli_sock);
+ 
++			printf("> request (%lu) ...  %s\n", chkpt_num, ret == 0 ? "OK" : "FAIL");
++
+ 			close(cli_sock);
+ 
+ 			exit(ret != 0);
+@@ -972,126 +1057,3 @@ int cr_tcp_service(bool daemon_mode)
+ err:
+ 	return 1;
+ }
+-
+-int cr_udp_service(bool daemon_mode)
+-{
+-	int srv_sock;
+-	struct addrinfo hints, *srv_info, *p;
+-	int yes = 1;
+-
+-	struct sockaddr_storage cli_addr;
+-	socklen_t cli_addr_sz;
+-	unsigned char buf[CR_MAX_MSG_SIZE];
+-	int buf_len;
+-
+-	int child_pid;
+-	int rv;
+-
+-	memset(&hints, 0, sizeof hints);
+-	hints.ai_family = AF_INET;
+-	hints.ai_socktype = SOCK_DGRAM;
+-	hints.ai_flags = AI_PASSIVE;
+-
+-	if ((rv = getaddrinfo(CR_DEF_SRVC_ADDR, CR_DEF_SRVC_PORT,
+-			      &hints, &srv_info)) != 0) {
+-		fprintf(stderr, "cr_udp_service> failed in 'getaddrinfo'; %s\n",
+-			gai_strerror(rv));
+-		goto err;
+-	}
+-
+-	/* Bind to the first result. */
+-	for (p = srv_info; p != NULL; p = p->ai_next) {
+-		if ((srv_sock = socket(p->ai_family,
+-				       p->ai_socktype,
+-				       p->ai_protocol)) == -1) {
+-			perror("cr_udp_service> failed to create socket");
+-			continue;
+-		}
+-
+-		if (setsockopt(srv_sock, SOL_SOCKET, SO_REUSEADDR,
+-			       &yes, sizeof(int)) == -1) {
+-			perror("cr_udp_service> failed to set socket options");
+-			continue;
+-		}
+-
+-		if (bind(srv_sock, p->ai_addr, p->ai_addrlen) == -1) {
+-			close(srv_sock);
+-			perror("cr_udp_service> failed to bind socket.");
+-			continue;
+-		}
+-
+-		break;
+-	}
+-	
+-	if (p == NULL) {
+-		fprintf(stderr, "cr_udp_service> failed to bind!\n");
+-		goto err;
+-	}
+-
+-	freeaddrinfo(srv_info);
+-
+-	if (setup_sigchld_handler()) {
+-		fprintf(stderr, "cr_udp_service> failed to setup SIGCHLD handler.\n");
+-		goto err;
+-	}
+-
+-	if (daemon_mode) {
+-		if (daemon(1, 0) == -1) {
+-			pr_perror("cr_udp_service> cannot run service server in the background");
+-			goto err;
+-		}
+-	}
+-
+-	printf("cr_udp_service> initialized and running ...\n");
+-
+-	while(1) {
+-		cli_addr_sz = sizeof cli_addr;
+-		buf_len = recvfrom(srv_sock, buf, CR_MAX_MSG_SIZE-1, 0,
+-				   (struct sockaddr *) &cli_addr, &cli_addr_sz);
+-
+-		if ((child_pid = fork()) == 0) {
+-			int cli_sock;
+-			int ret;
+-
+-			/* NOTE: Server socket is not required in child. */
+-			close(srv_sock);
+-
+-			if (restore_sigchld_handler()) {
+-				exit(1);
+-			}
+-
+-			if ((cli_sock = socket(AF_INET, SOCK_DGRAM, 17)) == -1) {
+-				perror("cr_udp_service> failed to create socket to connect to caller");
+-				exit(1);
+-			}
+-			
+-			if (setsockopt(cli_sock, SOL_SOCKET, SO_REUSEADDR,
+-				       &yes, sizeof(int)) == -1) {
+-				perror("cr_udp_service> failed to set socket options");
+-				exit(1);
+-			}
+-
+-			if (connect(cli_sock, (struct sockaddr *) &cli_addr, cli_addr_sz) == -1) {
+-				perror("cr_udp_service> failed to connect to caller");
+-				exit(1);
+-			}
+-
+-			init_opts();
+-			ret = cr_service_work_from_buf(cli_sock, buf, buf_len);
+-
+-			close(cli_sock);
+-
+-			exit(ret != 0);
+-		}
+-
+-		if (child_pid < 0) {
+-			fprintf(stderr, "cr_udp_service> failed to fork connection handler.");
+-
+-			close(srv_sock);
+-			goto err;
+-		}
+-	}
+-	
+-err:
+-	return 1;
+-}
+diff --git a/crtools.c b/crtools.c
+index fc9a1c1..b58e716 100644
+--- a/crtools.c
++++ b/crtools.c
+@@ -444,7 +444,7 @@ int main(int argc, char *argv[])
+ 	}
+ 
+ 	/* We must not open imgs dir, if service is called */
+-	if (strcmp(argv[optind], "service")) {
++	if (strcmp(argv[optind], "service") || strcmp(argv[optind], "tcp-service")) {
+ 		ret = open_image_dir(imgs_dir);
+ 		if (ret < 0)
+ 			return 1;
+@@ -514,9 +514,6 @@ int main(int argc, char *argv[])
+ 	if (!strcmp(argv[optind], "tcp-service"))
+ 		return cr_tcp_service(opts.restore_detach);
+ 
+-	if (!strcmp(argv[optind], "udp-service"))
+-		return cr_udp_service(opts.restore_detach);
+-
+ 	if (!strcmp(argv[optind], "dedup"))
+ 		return cr_dedup() != 0;
+ 
+@@ -544,7 +541,6 @@ usage:
+ "  page-server    launch page server\n"
+ "  service        launch service\n"
+ "  tcp-service    launch TCP service\n"
+-"  udp-service    launch TCP service\n"
+ "  dedup          remove duplicates in memory dump\n"
+ 	);
+ 
+@@ -610,7 +606,7 @@ usage:
+ "                        when used on restore, as soon as page is restored, it\n"
+ "                        will be punched from the image.\n"
+ "\n"
+-"Page/Service server options:\n"
++"Page/Service/TCP-Service server options:\n"
+ "  --address ADDR        address of server or service\n"
+ "  --port PORT           port of page server\n"
+ "  -d|--daemon           run in the background after creating socket\n"
+diff --git a/image.c b/image.c
+index 566073b..9571a17 100644
+--- a/image.c
++++ b/image.c
+@@ -71,8 +71,10 @@ int write_img_inventory(void)
+ 	pr_info("Writing image inventory (version %u)\n", CRTOOLS_IMAGES_V1);
+ 
+ 	fd = open_image(CR_FD_INVENTORY, O_DUMP);
+-	if (fd < 0)
++	if (fd < 0) {
++		pr_perror("Failed at 'open_image'!");
+ 		return -1;
++	}
+ 
+ 	he.img_version = CRTOOLS_IMAGES_V1;
+ 	he.fdinfo_per_id = true;
+@@ -84,17 +86,22 @@ int write_img_inventory(void)
+ 	crt.pid.real = getpid();
+ 	if (get_task_ids(&crt)) {
+ 		close(fd);
++		pr_perror("Failed at 'get_task_ids'!");
+ 		return -1;
+ 	}
+ 
+ 	he.has_root_cg_set = true;
+-	if (dump_task_cgroup(NULL, &he.root_cg_set))
++	if (dump_task_cgroup(NULL, &he.root_cg_set)) {
++		pr_perror("Failed at 'dump_task_cgroup'!");
+ 		return -1;
++	}
+ 
+ 	he.root_ids = crt.ids;
+ 
+-	if (pb_write_one(fd, &he, PB_INVENTORY) < 0)
++	if (pb_write_one(fd, &he, PB_INVENTORY) < 0) {
++		pr_perror("Failed at 'pb_write_one'!");
+ 		return -1;
++	}
+ 
+ 	xfree(crt.ids);
+ 	close(fd);
+diff --git a/include/cr-service.h b/include/cr-service.h
+index da4928e..c2efa2c 100644
+--- a/include/cr-service.h
++++ b/include/cr-service.h
+@@ -3,9 +3,24 @@
+ 
+ #include "protobuf/rpc.pb-c.h"
+ 
++#define CHKPT_DUMP_BASE_DIR "/legosdn/checkpoints"
++#define CHKPT_DUMP_PATH_MAX_LEN 256
++
++/* #checkpoints after which it is SAFE to turn on incremental checkpointing. */
++#define SAFE_CHKPT_NUM 4
++
++/* #checkpoints after which a FULL checkpoint is generated. */
++#define FULL_CHKPT_FREQ 32
++
++/* Buffer holding command to delete checkpoints */
++#define CHKPT_CLEAR_CMD_LEN 320
++
++#define TCP_SRVC_ADDR "127.0.0.1"
++#define TCP_SRVC_PORT "9080"
++#define TCP_SRVC_BACKLOG 4
++
+ extern int cr_service(bool deamon_mode);
+ extern int cr_tcp_service(bool deamon_mode);
+-extern int cr_udp_service(bool deamon_mode);
+ int cr_service_work(int sk);
+ 
+ extern int send_criu_dump_resp(int socket_fd, bool success, bool restored);
+diff --git a/launch-criu-tcp-service.sh b/launch-criu-tcp-service.sh
+new file mode 100755
+index 0000000..060e3c3
+--- /dev/null
++++ b/launch-criu-tcp-service.sh
+@@ -0,0 +1,32 @@
++#!/usr/bin/env bash
++# -*- mode: sh; coding: utf-8; fill-column: 80; -*-
++#
++# launch-criu-tcp-service.sh
++# Created by Balakrishnan Chandrasekaran on 2015-01-26 21:29 -0400.
++#
++
++CHKPTS_BASE_DIR='/legosdn/checkpoints'
++CRIU_LOG="${CHKPTS_BASE_DIR}/criu-log.txt"
++
++if [ ${LEGOSDN_HOME:-''} == '' ]; then
++    echo 'Error: LEGOSDN_HOME not set!' >& 2
++    exit 1
++fi
++
++if [ -d ${CHKPTS_BASE_DIR} ]; then
++    sudo rm -rf ${CHKPTS_BASE_DIR}
++    [ $? -eq 0 ]							&& \
++	echo "> removed old checkpoints in '${CHKPTS_BASE_DIR}'"	&& \
++	sudo mkdir -p ${CHKPTS_BASE_DIR}
++else
++    echo "> path '${CHKPTS_BASE_DIR}' missing!" >& 2
++    sudo mkdir -p ${CHKPTS_BASE_DIR}					&& \
++	echo "> path '${CHKPTS_BASE_DIR}' created"
++    [ $? -ne 0 ]							&& \
++	echo "> failed to create path '${CHKPTS_BASE_DIR}'" >& 2	&& \
++	exit 1
++fi
++
++CRIU_BASE_DIR="${LEGOSDN_HOME}/criu"
++rm -f ${CRIU_LOG}
++sudo ${CRIU_BASE_DIR}/crtools tcp-service --log-file ${CRIU_LOG}
+-- 
+1.9.1
+
+
+From 71c1c9620513d7507efcb572c04eec983718ef1f Mon Sep 17 00:00:00 2001
+From: Bala Chandrasekaran <balac@cs.duke.edu>
+Date: Thu, 5 Mar 2015 14:19:11 -0500
+Subject: [PATCH 4/6] Ensure cleanup only happens on save.
+
+---
+ cr-service.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/cr-service.c b/cr-service.c
+index 9186cd2..a7c5b30 100644
+--- a/cr-service.c
++++ b/cr-service.c
+@@ -209,7 +209,7 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
+ 
+ 	/* printf("> last-available checkpoint: %lu\n", last_available); */
+ 
+-	if ((chkpt_num % FULL_CHKPT_FREQ) == 0) {
++	if ((!opts.restore_detach) && ((chkpt_num % FULL_CHKPT_FREQ) == 0)) {
+ 		if (fork() == 0) {
+ 			/* Cleanup process. */
+ 			char clear_cmd[CHKPT_CLEAR_CMD_LEN];
+-- 
+1.9.1
+
+
+From 852ec4213cb70208f56d794c47f2134c1a4d7581 Mon Sep 17 00:00:00 2001
+From: Bala Chandrasekaran <balac@cs.duke.edu>
+Date: Wed, 9 Sep 2015 06:28:47 -0400
+Subject: [PATCH 5/6] Make CRIU 1.3 compatible with LegoSDN.
+
+---
+ cr-service.c                | 451 +++++++++++++++++++++++++++++---------------
+ include/cr-service.h        |  11 +-
+ launch-criu-tcp-service.sh  |  30 ++-
+ protobuf/rpc.proto          |   1 +
+ protobuf/rpc.proto.original | 108 +++++++++++
+ 5 files changed, 437 insertions(+), 164 deletions(-)
+ create mode 100644 protobuf/rpc.proto.original
+
+diff --git a/cr-service.c b/cr-service.c
+index a7c5b30..c5bc17b 100644
+--- a/cr-service.c
++++ b/cr-service.c
+@@ -13,6 +13,7 @@
+ #include <sys/wait.h>
+ #include <sys/stat.h>
+ #include <netdb.h>
++#include <netinet/tcp.h>
+ 
+ #include "crtools.h"
+ #include "cr_options.h"
+@@ -28,7 +29,7 @@
+ #include "cgroup.h"
+ 
+ unsigned int service_sk_ino = -1;
+-static unsigned long chkpt_num = 0;
++/* static unsigned long chkpt_num = 0; */
+ 
+ static int restore_sigchld_handler();
+ 
+@@ -58,27 +59,27 @@ static int recv_criu_msg(int socket_fd, CriuReq **msg)
+ 	return 0;
+ }
+ 
+-static int load_criu_msg(const unsigned char *buf, int buf_len, CriuReq **msg)
+-{
+-	if (buf_len == -1) {
+-		pr_perror("Can't read request");
+-		return -1;
+-	}
++/* static int load_criu_msg(const unsigned char *buf, int buf_len, CriuReq **msg) */
++/* { */
++/* 	if (buf_len == -1) { */
++/* 		pr_perror("Can't read request"); */
++/* 		return -1; */
++/* 	} */
+ 
+-	if (buf_len == 0) {
+-		pr_info("Client exited unexpectedly\n");
+-		errno = ECONNRESET;
+-		return -1;
+-	}
++/* 	if (buf_len == 0) { */
++/* 		pr_info("Client exited unexpectedly\n"); */
++/* 		errno = ECONNRESET; */
++/* 		return -1; */
++/* 	} */
+ 
+-	*msg = criu_req__unpack(NULL, buf_len, buf);
+-	if (!*msg) {
+-		pr_perror("Failed unpacking request");
+-		return -1;
+-	}
++/* 	*msg = criu_req__unpack(NULL, buf_len, buf); */
++/* 	if (!*msg) { */
++/* 		pr_perror("Failed unpacking request"); */
++/* 		return -1; */
++/* 	} */
+ 
+-	return 0;
+-}
++/* 	return 0; */
++/* } */
+ 
+ static int send_criu_msg(int socket_fd, CriuResp *msg)
+ {
+@@ -191,7 +192,7 @@ int send_criu_rpc_script(char *script, int fd)
+ 	return 0;
+ }
+ 
+-static int setup_opts_from_req(int sk, CriuOpts *req)
++static int _setup_opts_from_req(int sk, CriuOpts *req, int reqd, int resd)
+ {
+ 	const char *output_base_path = CHKPT_DUMP_BASE_DIR;
+ 	char output_dir[CHKPT_DUMP_PATH_MAX_LEN];
+@@ -203,39 +204,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
+ 	char work_dir_path[PATH_MAX];
+ 	int i;
+ 
+-	/* Last available checkpoint. */
+-	unsigned long last_available = FULL_CHKPT_FREQ * (chkpt_num / FULL_CHKPT_FREQ);
+-	if (last_available == 0) last_available = SAFE_CHKPT_NUM;
+-
+-	/* printf("> last-available checkpoint: %lu\n", last_available); */
+-
+-	if ((!opts.restore_detach) && ((chkpt_num % FULL_CHKPT_FREQ) == 0)) {
+-		if (fork() == 0) {
+-			/* Cleanup process. */
+-			char clear_cmd[CHKPT_CLEAR_CMD_LEN];
+-			unsigned long old_chkpt_num = chkpt_num - 1;
+-			unsigned long last_remaining = FULL_CHKPT_FREQ * (old_chkpt_num / FULL_CHKPT_FREQ);
+-			int ret = 0;
+-
+-			/* if (restore_sigchld_handler()) { */
+-			/* 	exit(1); */
+-			/* } */
+-
+-			/* NOTE: Client socket is not required in child. */
+-			// close(sk);
+-
+-			while (old_chkpt_num >= last_remaining) {
+-				/* NOTE: Use path of last successful checkpoint. */
+-				sprintf(clear_cmd, "sudo rm -rf %s/%lu", output_base_path, old_chkpt_num);
+-
+-				ret |= system(clear_cmd);
+-
+-				old_chkpt_num--;
+-			}
+-
+-			exit(ret != 0);
+-		}
+-	}
++    /* Checkpoint/restore ID requests */
++    char cr_id_buf[CR_ID_BUF_SZ];
++    unsigned long chkpt_num = 0;
+ 
+ 	/*
+ 	 * NOTE: SO_PEERCRED only applies to sockets in the Unix domain.
+@@ -277,48 +248,64 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
+ 	 */
+ 
+ 	int fd = -1;
++    int found_parent = 0;
+         /* Incremental dumps, as indicated by the number in the end of the path. */
+ 	if (opts.restore_detach) {
+-                /* NOTE: Use last successful checkpoint. */
+-		chkpt_num--;
+-
+-                /* printf("> RESTORE %lu\n", chkpt_num); */
+-
+-                /* NOTE: Use path of last successful checkpoint. */
+-		sprintf(output_dir, "%s/%lu", output_base_path, chkpt_num);
+-
+-		while (/* chkpt_num >= last_available */ chkpt_num >= SAFE_CHKPT_NUM) {
+-			fd = open(output_dir, O_RDONLY);
+-			if (fd < 0) {
+-				pr_perror("Can't open prior checkpoint %s", output_dir);
+-			} else {
+-                                /* printf("> using prior checkpoint path %s\n", output_dir); */
+-				break;
+-			}
+-
+-                        /* Check for an earlier checkpoint */
+-			chkpt_num--;
+-			sprintf(output_dir, "%s/%lu", output_base_path, chkpt_num);
+-		}
+-
+-		if (fd < 0) {
+-			pr_perror("Failed to find a checkpoint to restore from!");
+-			return -1;
+-		}
++        memset(cr_id_buf, 0, sizeof(cr_id_buf));
++        sprintf(cr_id_buf, "%d;%d", GET_RESTORE_ID, req->app_num);
++        if (write(reqd, cr_id_buf, strlen(cr_id_buf) + 1) <= 0) {
++            pr_perror("write: failed to write request(GET_RESTORE_ID)!");
++            return -1;
++        }
++
++        memset(cr_id_buf, 0, sizeof(cr_id_buf));
++        if (read(resd, cr_id_buf, CR_ID_BUF_SZ) <= 0) {
++            pr_perror("read: failed to read response(for GET_RESTORE_ID)!");
++            return -1;
++        }
++
++        chkpt_num = strtol(cr_id_buf, NULL, 10);
++        pr_info("> attempting restore from '%lu'\n", chkpt_num);
++        
++        
++        /* NOTE: Use path of last successful checkpoint. */
++        sprintf(output_dir, "%s/%d/%lu", output_base_path, req->app_num, chkpt_num);
++
++        if ((fd = open(output_dir, O_RDONLY)) < 0) {
++            pr_perror("Can't open prior checkpoint '%s'", output_dir);
++        } else {
++            pr_info("> using prior checkpoint path '%s'\n", output_dir);
++        }
++
++        if (fd < 0) {
++            pr_perror("Failed to find a checkpoint to restore from!");
++            return -1;
++        }
+ 	} else {
+-		/* printf("> DUMP %lu\n", chkpt_num); */
+-
+-		sprintf(output_dir, "%s/%lu", output_base_path, chkpt_num);
+-
+-                /* Since caller is not communicating over SOCK_SEQPACKET
+-		 * protocol, caller cannot pass on the file handle for the output
+-		 * directory. Hence, calle (the CRIU service) creates the destination
+-		 * directory and populates the request options with the file handle.
+-		 *
+-		 * NOTE: This presents some serious security risks if caller
+-		 * is NOT TRUST WORTHY.
+-		 */
+-		if (mkdir(output_dir, S_IREAD | S_IWRITE) < 0) {
++        memset(cr_id_buf, '\0', sizeof(cr_id_buf));
++        sprintf(cr_id_buf, "%d;%d", GET_CHKPT_ID, req->app_num);
++        if (write(reqd, cr_id_buf, strlen(cr_id_buf) + 1) <= 0) {
++            pr_perror("write: failed to write request(GET_CHKPT_ID)!");
++            return -1;
++        }
++
++        memset(cr_id_buf, 0, sizeof(cr_id_buf));
++        if (read(resd, cr_id_buf, CR_ID_BUF_SZ) <= 0) {
++            pr_perror("read: failed to read response(for GET_CHKPT_ID)!");
++            return -1;
++        }
++
++        /* Errors, if any, will be caught in the next call */
++        memset(output_dir, 0, sizeof(output_dir));
++        sprintf(output_dir, "%s/%d", output_base_path, req->app_num);
++        mkdir(output_dir, S_IREAD | S_IWRITE);
++
++        chkpt_num = strtol(cr_id_buf, NULL, 10);
++        memset(output_dir, 0, sizeof(output_dir));
++        sprintf(output_dir, "%s/%d/%lu", output_base_path, req->app_num, chkpt_num);
++
++
++        if (mkdir(output_dir, S_IREAD | S_IWRITE) < 0) {
+ 			pr_perror("Failed to create output path %s!", output_dir);
+ 			return -1;
+ 		}
+@@ -328,37 +315,56 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
+ 			pr_perror("Can't open output path %s", output_dir);
+ 			return -1;
+ 		}
+-
+-		unsigned long prev_chkpt_num = chkpt_num - 1;
+-		while ((chkpt_num > SAFE_CHKPT_NUM) &&
+-		       (prev_chkpt_num >= last_available)) {
+-			sprintf(parent_dir, "%s/%lu", output_base_path, prev_chkpt_num);
+-
+-			int pd = open(parent_dir, O_RDONLY);
+-			if (pd < 0) {
+-				pr_perror("Can't open prior checkpoint path %s", parent_dir);
+-			} else {
+-                                /* printf("> using prior checkpoint path %s\n", parent_dir); */
+-				close(pd);
+-				break;
+-			}
+-
+-                        /* Check for an earlier checkpoint */
+-			prev_chkpt_num--;
+-			sprintf(parent_dir, "%s/%lu", output_base_path, prev_chkpt_num);
++        pr_info("> saving current checkpoint to %s\n", output_dir);
++
++        memset(cr_id_buf, 0, sizeof(cr_id_buf));
++        sprintf(cr_id_buf, "%d;%d", GET_LAST_CHKPT_ID, req->app_num);
++        if (write(reqd, cr_id_buf, strlen(cr_id_buf) + 1) <= 0) {
++            pr_perror("write: failed to write request(GET_LAST_CHKPT_ID)!");
++            return -1;
++        }
++
++        memset(cr_id_buf, 0, sizeof(cr_id_buf));
++        if (read(resd, cr_id_buf, CR_ID_BUF_SZ) <= 0) {
++            pr_perror("read: failed to read response(for GET_LAST_CHKPT_ID)!");
++            return -1;
++        }
++        
++        unsigned long prev_chkpt_num = strtol(cr_id_buf, NULL, 10);
++        if (prev_chkpt_num > 0) {
++            int pd = -1;
++
++            sprintf(parent_dir, "%s/%d/%lu", output_base_path, req->app_num, prev_chkpt_num);
++            pd = open(parent_dir, O_RDONLY);
++            if (pd < 0) {
++            pr_perror("Can't open prior checkpoint path %s", parent_dir);
++            found_parent = 0;
++            } else {
++                close(pd);
++                pr_info("> using prior checkpoint path %s\n", parent_dir);
++                found_parent = 1;
++            }
+ 		}
+ 	}
+ 	req->images_dir_fd = fd;
+ 
+ 	int cr_srvc_pid = getpid();
+ 
+-        /* open images_dir */
+-        /* sprintf(images_dir_path, "/proc/%d/fd/%d", ids.pid, req->images_dir_fd); */
+-	sprintf(images_dir_path, "/proc/%d/fd/%d", cr_srvc_pid, req->images_dir_fd);
++    /* open images_dir */
++    /* sprintf(images_dir_path, "/proc/%d/fd/%d", ids.pid, req->images_dir_fd); */
++    sprintf(images_dir_path, "/proc/%d/fd/%d", cr_srvc_pid, req->images_dir_fd);
+ 
+ 	if (req->parent_img)
+ 		opts.img_parent = req->parent_img;
+ 
++
++    if (chkpt_num > SAFE_CHKPT_NUM &&
++        !opts.restore_detach &&
++        ((chkpt_num % FULL_CHKPT_FREQ) != 0)) {
++        /* NOTE: At this point, we can be sure that the prior checkpoints exist! */
++        if (found_parent == 1) opts.img_parent = parent_dir;
++    }
++
+ 	if (open_image_dir(images_dir_path) < 0) {
+ 		pr_perror("Can't open images directory '%s'", images_dir_path);
+ 		return -1;
+@@ -505,12 +511,16 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
+ 	return 0;
+ }
+ 
+-static int dump_using_req(int sk, CriuOpts *req)
++static int setup_opts_from_req(int sk, CriuOpts *req) {
++    return _setup_opts_from_req(sk, req, -1, -1);
++}
++
++static int _dump_using_req(int sk, CriuOpts *req, int reqd, int resd)
+ {
+ 	bool success = false;
+ 	bool self_dump = !req->pid;
+ 
+-	if (setup_opts_from_req(sk, req))
++	if (_setup_opts_from_req(sk, req, reqd, resd))
+ 		goto exit;
+ 
+ 	/*
+@@ -534,7 +544,12 @@ exit:
+ 	return success ? 0 : 1;
+ }
+ 
+-static int restore_using_req(int sk, CriuOpts *req)
++static int dump_using_req(int sk, CriuOpts *req) {
++    return _dump_using_req(sk, req, -1, -1);
++}
++
++
++static int _restore_using_req(int sk, CriuOpts *req, int reqd, int resd)
+ {
+ 	bool success = false;
+ 
+@@ -546,7 +561,7 @@ static int restore_using_req(int sk, CriuOpts *req)
+ 
+ 	opts.restore_detach = true;
+ 
+-	if (setup_opts_from_req(sk, req))
++	if (_setup_opts_from_req(sk, req, reqd, resd))
+ 		goto exit;
+ 
+ 	if (cr_restore_tasks())
+@@ -580,6 +595,11 @@ exit:
+ 	return success ? 0 : 1;
+ }
+ 
++/* static int restore_using_req(int sk, CriuOpts *req) */
++/* { */
++/*     return _restore_using_req(sk, req, -1, -1); */
++/* } */
++
+ static int check(int sk)
+ {
+ 	CriuResp resp = CRIU_RESP__INIT;
+@@ -692,10 +712,10 @@ out:
+ 	return send_criu_msg(sk, &resp);
+ }
+ 
+-int cr_service_work(int sk)
++int _cr_service_work(int sk, int reqd, int resd)
+ {
++	int ret = -1;
+ 	CriuReq *msg = 0;
+-	int ret = 0;
+ 
+ 	if (recv_criu_msg(sk, &msg) == -1) {
+ 		pr_perror("Can't recv request");
+@@ -704,22 +724,28 @@ int cr_service_work(int sk)
+ 
+ 	switch (msg->type) {
+ 	case CRIU_REQ_TYPE__DUMP:
+-		ret = dump_using_req(sk, msg->opts);
++        pr_info("> request: CRIU_REQ_TYPE__DUMP\n");
++		ret = _dump_using_req(sk, msg->opts, reqd, resd);
+ 		break;
+ 	case CRIU_REQ_TYPE__RESTORE:
+-		ret = restore_using_req(sk, msg->opts);
++        pr_info("> request: CRIU_REQ_TYPE__RESTORE\n");
++		ret = _restore_using_req(sk, msg->opts, reqd, resd);
+ 		break;
+ 	case CRIU_REQ_TYPE__CHECK:
++        pr_info("> request: CRIU_REQ_TYPE__CHECK\n");
+ 		ret = check(sk);
+ 		break;
+ 	case CRIU_REQ_TYPE__PRE_DUMP:
++        pr_info("> request: CRIU_REQ_TYPE__PRE_DUMP\n");
+ 		ret = pre_dump_loop(sk, msg);
+ 		break;
+ 	case CRIU_REQ_TYPE__PAGE_SERVER:
++        pr_info("> request: CRIU_REQ_TYPE__PAGE_SERVER\n");
+ 		ret = start_page_server_req(sk, msg->opts);
+ 		break;
+ 
+ 	default:
++        pr_info("> request: INVALID");
+ 		send_criu_err(sk, "Invalid req");
+ 		goto err;
+ 	}
+@@ -730,34 +756,108 @@ err:
+ 	return -1;
+ }
+ 
+-int cr_service_work_from_buf(int cli_sock, const unsigned char *buf, int buf_len)
++int cr_service_work(int sk)
+ {
+-	CriuReq *msg = 0;
+-
+-	if (load_criu_msg(buf, buf_len, &msg) == -1) {
+-		pr_perror("Can't recv request");
+-		goto err;
+-	}
+-
+-	switch (msg->type) {
+-	case CRIU_REQ_TYPE__DUMP:
+-		return dump_using_req(cli_sock, msg->opts);
+-	case CRIU_REQ_TYPE__RESTORE:
+-		return restore_using_req(cli_sock, msg->opts);
+-	case CRIU_REQ_TYPE__CHECK:
+-		return check(cli_sock);
+-	case CRIU_REQ_TYPE__PRE_DUMP:
+-		return pre_dump_loop(cli_sock, msg);
+-	case CRIU_REQ_TYPE__PAGE_SERVER:
+-		return start_page_server_req(cli_sock, msg->opts);
+-
+-	default:
+-		send_criu_err(cli_sock, "Invalid req");
+-		goto err;
+-	}
++    return _cr_service_work(sk, -1, -1);
++}
+ 
+-err:
+-	return -1;
++int run_chkpt_num_proc(int req_pipe[2], int res_pipe[2])
++{
++    const char sep[2] = ";";
++    static unsigned long chkpt_num[MAX_NUM_APPS];
++    int child_pid;
++    if ((child_pid = fork()) == 0) {
++        char buf[CR_ID_BUF_SZ];
++
++        int _req = req_pipe[0];
++        int _res = res_pipe[1];
++
++        close(req_pipe[1]);
++        close(res_pipe[0]);
++
++        if (restore_sigchld_handler()) {
++            exit(1);
++        }
++
++        while(1) {
++            int app_num = -1;
++            int req_type = -1;
++            unsigned long res_val = 0;
++            int n;
++            char *tok;
++
++            memset(buf, 0, sizeof(buf));
++            if ((n = read(_req, buf, CR_ID_BUF_SZ)) <= 0) {
++                pr_perror("run_chkpt_num_proc: failed while reading request!");
++                exit(-1);
++            }
++            /* printf("> chkpt_num_proc: read %d bytes (request); buffer: '%s'\n", n, buf); */
++            tok = strtok(buf, sep);
++            req_type = strtol(tok, NULL, 10);
++
++            tok = strtok(NULL, sep);
++            app_num = atoi(tok);
++
++            /* printf("> chkpt_num_proc: request: %d; app-num: %d\n", req_type, app_num); */
++            if (app_num < 0 || app_num > MAX_NUM_APPS) {
++                pr_perror("run_chkpt_num_proc: invalid application number!");
++                exit(-1);
++            }
++
++            switch (req_type) {
++            case GET_CHKPT_ID:
++                /* Checkpoint */
++                res_val = ++chkpt_num[app_num];
++                break;
++            case GET_RESTORE_ID:
++                /* Restore */
++                res_val = chkpt_num[app_num];
++                break;
++            case GET_LAST_CHKPT_ID:
++                /* Last successful checkpoint */
++                res_val = chkpt_num[app_num] - 1;
++                break;
++            case QUIT_ID_PROC:
++                /* Quit */
++                exit(0);
++            default:
++                pr_perror("run_chkpt_num_proc: unknown request type!");
++                break;
++            }
++
++            sprintf(buf, "%lu", res_val);
++            if (write(_res, buf, strlen(buf)+1) <= 0) {
++                pr_perror("run_chkpt_num_proc: failed while writing response!");
++                exit(-1);
++            }
++
++            if ((req_type == GET_CHKPT_ID) && ((chkpt_num[app_num] % FULL_CHKPT_FREQ) == 0)) {
++                int ret = 0;
++                /* Cleanup process. */
++                const char *output_base_path = CHKPT_DUMP_BASE_DIR;
++                char clear_cmd[CHKPT_CLEAR_CMD_LEN];
++                unsigned long beg_id = chkpt_num[app_num] - 1;
++                unsigned long end_id = chkpt_num[app_num] - FULL_CHKPT_FREQ;
++                if (end_id == 0) end_id = 1;
++
++                while (beg_id >= end_id) {
++                    /* NOTE: Use path of last successful checkpoint. */
++                    sprintf(clear_cmd, "sudo rm -rf %s/%lu", output_base_path, beg_id);
++
++                    ret = system(clear_cmd);
++
++                    if (ret != 0) {
++                        pr_perror("> system: failed to run '%s'!", clear_cmd);
++                    }
++
++                    beg_id--;
++                }
++            }
++        }
++
++        exit(0);
++    }
++    return child_pid;
+ }
+ 
+ static void reap_worker(int signo)
+@@ -813,7 +913,7 @@ static int restore_sigchld_handler()
+ 	sigemptyset(&action.sa_mask);
+ 	sigaddset(&action.sa_mask, SIGCHLD);
+ 	action.sa_handler	= SIG_DFL;
+-	action.sa_flags		= SA_RESTART;
++	action.sa_flags		= SA_RESTART | SA_NOCLDSTOP | SA_NOCLDWAIT;
+ 
+ 	if (sigaction(SIGCHLD, &action, NULL)) {
+ 		pr_perror("Can't restore SIGCHLD handler");
+@@ -950,6 +1050,10 @@ int cr_tcp_service(bool daemon_mode)
+ 	int child_pid;
+ 	int rv;
+ 
++    /* Pipes for requests and responses */
++    int req_pipe[2];
++    int res_pipe[2];
++
+ 	memset(&hints, 0, sizeof hints);
+ 	hints.ai_family = AF_INET;
+ 	hints.ai_socktype = SOCK_STREAM;
+@@ -962,7 +1066,7 @@ int cr_tcp_service(bool daemon_mode)
+ 		goto err;
+ 	}
+ 
+-        /* Bind to the first result. */
++    /* Bind to the first result. */
+ 	for (p = srv_info; p != NULL; p = p->ai_next) {
+ 		if ((srv_sock = socket(p->ai_family,
+ 				       p->ai_socktype,
+@@ -973,10 +1077,16 @@ int cr_tcp_service(bool daemon_mode)
+ 
+ 		if (setsockopt(srv_sock, SOL_SOCKET, SO_REUSEADDR,
+ 			       &yes, sizeof(int)) == -1) {
+-			perror("cr_tcp_service> failed to set socket options");
++            perror("cr_tcp_service> failed to set socket option SO_REUSEADDR");
+ 			continue;
+ 		}
+ 
++        if (setsockopt(srv_sock, IPPROTO_TCP, TCP_NODELAY,
++                       &yes, sizeof(int)) == -1) {
++            perror("cr_tcp_service> failed to set socket option TCP_NODELAY");
++            continue;
++        }
++
+ 		if (bind(srv_sock, p->ai_addr, p->ai_addrlen) == -1) {
+ 			close(srv_sock);
+ 			perror("cr_tcp_service> failed to bind socket.");
+@@ -1012,6 +1122,17 @@ int cr_tcp_service(bool daemon_mode)
+ 
+ 	/* printf("cr_tcp_service> initialized and running ...\n"); */
+ 
++    if ((pipe(req_pipe) == -1) ||
++        (pipe(res_pipe) == -1)) {
++        pr_perror("pipe: failed to create pipes!");
++        goto err;
++    }
++
++    if (run_chkpt_num_proc(req_pipe, res_pipe) < 0) {
++        pr_perror("run_chkpt_num_proc: failed to spawn checkpoint counter process!");
++        goto err;
++    }
++
+ 	while(1) {
+ 		cli_addr_sz = sizeof cli_addr;
+ 		cli_sock = accept(srv_sock, (struct sockaddr *) &cli_addr, &cli_addr_sz);
+@@ -1020,13 +1141,31 @@ int cr_tcp_service(bool daemon_mode)
+ 			continue;
+ 		}
+ 
+-		chkpt_num += 1;
+-		/* printf("> #requests: %lu\n", chkpt_num); */
++        /* chkpt_num += 1; */
++        /* pr_info("> #requests: %lu\n", chkpt_num); */
+ 
+ 		if ((child_pid = fork()) == 0) {
+ 			int ret;
++            int _req = req_pipe[1];
++            int _res = res_pipe[0];
++
++            close(req_pipe[0]);
++            close(res_pipe[1]);
++
++            /* if (write(_req, GET_CHKPT_ID, strlen(GET_CHKPT_ID) + 1) <= 0) { */
++            /* pr_perror("write: failed to write request(GET_CHKPT_ID)!"); */
++            /* exit(1); */
++            /* } */
++
++            /* if (read(_res, buf, BUF_SZ) <= 0) { */
++            /* pr_perror("read: failed to read response(for GET_CHKPT_ID)!"); */
++            /* exit(1); */
++            /* } */
++            /* printf("> GET_CHKPT_ID: %s\n", buf); */
+ 
+ 			if (restore_sigchld_handler()) {
++                /* pr_info("> request (%lu) ...  FAIL\n", chkpt_num); */
++                pr_info("> request  ...  FAIL\n");
+ 				exit(1);
+ 			}
+ 
+@@ -1034,12 +1173,16 @@ int cr_tcp_service(bool daemon_mode)
+ 			close(srv_sock);
+ 
+ 			init_opts();
+-			ret = cr_service_work(cli_sock);
++			ret = _cr_service_work(cli_sock, _req, _res);
+ 
+-			printf("> request (%lu) ...  %s\n", chkpt_num, ret == 0 ? "OK" : "FAIL");
++            /* printf("> request (%lu) ...  %s\n", chkpt_num, ret == 0 ? "OK" : "FAIL"); */
++            printf("> request ...  %s\n", ret == 0 ? "OK" : "FAIL");
+ 
+ 			close(cli_sock);
+ 
++            close(req_pipe[1]);
++            close(res_pipe[0]);
++
+ 			exit(ret != 0);
+ 		}
+ 
+diff --git a/include/cr-service.h b/include/cr-service.h
+index c2efa2c..af95641 100644
+--- a/include/cr-service.h
++++ b/include/cr-service.h
+@@ -7,10 +7,10 @@
+ #define CHKPT_DUMP_PATH_MAX_LEN 256
+ 
+ /* #checkpoints after which it is SAFE to turn on incremental checkpointing. */
+-#define SAFE_CHKPT_NUM 4
++#define SAFE_CHKPT_NUM 2
+ 
+ /* #checkpoints after which a FULL checkpoint is generated. */
+-#define FULL_CHKPT_FREQ 32
++#define FULL_CHKPT_FREQ 128
+ 
+ /* Buffer holding command to delete checkpoints */
+ #define CHKPT_CLEAR_CMD_LEN 320
+@@ -29,4 +29,11 @@ extern int send_criu_rpc_script(char *name, int arg);
+ extern struct _cr_service_client *cr_service_client;
+ extern unsigned int service_sk_ino;
+ 
++#define MAX_NUM_APPS 32
++#define CR_ID_BUF_SZ 64
++#define GET_CHKPT_ID 1
++#define GET_RESTORE_ID 2
++#define GET_LAST_CHKPT_ID 3
++#define QUIT_ID_PROC 4
++
+ #endif /* __CR_SERVICE_H__ */
+diff --git a/launch-criu-tcp-service.sh b/launch-criu-tcp-service.sh
+index 060e3c3..1ac6b5f 100755
+--- a/launch-criu-tcp-service.sh
++++ b/launch-criu-tcp-service.sh
+@@ -6,7 +6,8 @@
+ #
+ 
+ CHKPTS_BASE_DIR='/legosdn/checkpoints'
+-CRIU_LOG="${CHKPTS_BASE_DIR}/criu-log.txt"
++CRIU_LOGS_DIR="${CHKPTS_BASE_DIR}/criulogs"
++CRIU_LOG="${CRIU_LOGS_DIR}/criu-log.txt"
+ 
+ if [ ${LEGOSDN_HOME:-''} == '' ]; then
+     echo 'Error: LEGOSDN_HOME not set!' >& 2
+@@ -15,18 +16,31 @@ fi
+ 
+ if [ -d ${CHKPTS_BASE_DIR} ]; then
+     sudo rm -rf ${CHKPTS_BASE_DIR}
+-    [ $? -eq 0 ]							&& \
+-	echo "> removed old checkpoints in '${CHKPTS_BASE_DIR}'"	&& \
+-	sudo mkdir -p ${CHKPTS_BASE_DIR}
++    [ $? -eq 0 ]                                             && \
++	echo "> removed old checkpoints in '${CHKPTS_BASE_DIR}'" && \
++	sudo mkdir -p ${CHKPTS_BASE_DIR}                         && \
++    sudo mkdir -p ${CRIU_LOGS_DIR}
+ else
+     echo "> path '${CHKPTS_BASE_DIR}' missing!" >& 2
+-    sudo mkdir -p ${CHKPTS_BASE_DIR}					&& \
++    sudo mkdir -p ${CHKPTS_BASE_DIR}                         && \
++    sudo mkdir -p ${CRIU_LOGS_DIR}                           && \
+ 	echo "> path '${CHKPTS_BASE_DIR}' created"
+-    [ $? -ne 0 ]							&& \
+-	echo "> failed to create path '${CHKPTS_BASE_DIR}'" >& 2	&& \
++    [ $? -ne 0 ]                                             && \
++	echo "> failed to create path '${CHKPTS_BASE_DIR}'" >& 2 && \
+ 	exit 1
+ fi
+ 
+ CRIU_BASE_DIR="${LEGOSDN_HOME}/criu"
++CRTOOLS="${CRIU_BASE_DIR}/crtools"
++
++for p in $(sudo ps -elf | grep ${CRTOOLS} | grep -v grep | awk '{print $4}'); do
++    sudo kill -9 $p
++    if [ $? -eq 0 ]; then
++        echo "> kill stale proc '${p}'  .... OK"
++    else
++        echo "> kill stale proc '${p}'  .... FAIL"
++    fi
++done
++
+ rm -f ${CRIU_LOG}
+-sudo ${CRIU_BASE_DIR}/crtools tcp-service --log-file ${CRIU_LOG}
++sudo ${CRTOOLS} tcp-service -v4 --log-file ${CRIU_LOG}
+diff --git a/protobuf/rpc.proto b/protobuf/rpc.proto
+index 9dcc6b4..316f8ae 100644
+--- a/protobuf/rpc.proto
++++ b/protobuf/rpc.proto
+@@ -54,6 +54,7 @@ message criu_opts {
+ 	repeated cgroup_root		cg_root		= 25;
+ 
+ 	optional bool			rst_sibling	= 26; /* swrk only */
++    required int32          app_num = 27;
+ }
+ 
+ message criu_dump_resp {
+diff --git a/protobuf/rpc.proto.original b/protobuf/rpc.proto.original
+new file mode 100644
+index 0000000..9dcc6b4
+--- /dev/null
++++ b/protobuf/rpc.proto.original
+@@ -0,0 +1,108 @@
++message criu_page_server_info {
++	optional string		address	= 1;
++	optional int32		port	= 2;
++	optional int32		pid	= 3;
++}
++
++message criu_veth_pair {
++	required string		if_in	= 1;
++	required string		if_out	= 2;
++};
++
++message ext_mount_map {
++	required string		key	= 1;
++	required string		val	= 2;
++};
++
++message cgroup_root {
++	optional string		ctrl	= 1;
++	required string		path	= 2;
++};
++
++message criu_opts {
++	required int32			images_dir_fd	= 1;
++	optional int32			pid		= 2; /* if not set on dump, will dump requesting process */
++
++	optional bool			leave_running	= 3;
++	optional bool			ext_unix_sk	= 4;
++	optional bool			tcp_established	= 5;
++	optional bool			evasive_devices	= 6;
++	optional bool			shell_job	= 7;
++	optional bool			file_locks	= 8;
++	optional int32			log_level	= 9 [default = 2];
++	optional string			log_file	= 10; /* No subdirs are allowed. Consider using work-dir */
++
++	optional criu_page_server_info	ps		= 11;
++
++	optional bool			notify_scripts	= 12;
++
++	optional string			root		= 13;
++	optional string			parent_img	= 14;
++	optional bool			track_mem	= 15;
++	optional bool			auto_dedup	= 16;
++
++	optional int32			work_dir_fd	= 17;
++	optional bool			link_remap	= 18;
++	repeated criu_veth_pair		veths		= 19;
++
++	optional uint32			cpu_cap		= 20 [default = 0xffffffff];
++	optional bool			force_irmap	= 21;
++	repeated string			exec_cmd	= 22;
++
++	repeated ext_mount_map		ext_mnt		= 23;
++	optional bool			manage_cgroups	= 24;
++	repeated cgroup_root		cg_root		= 25;
++
++	optional bool			rst_sibling	= 26; /* swrk only */
++}
++
++message criu_dump_resp {
++	optional bool restored		= 1;
++}
++
++message criu_restore_resp {
++	required int32 pid		= 1;
++}
++
++message criu_notify {
++	optional string script		= 1;
++	optional int32	pid		= 2;
++}
++
++enum criu_req_type {
++	EMPTY		= 0;
++	DUMP		= 1;
++	RESTORE		= 2;
++	CHECK		= 3;
++	PRE_DUMP	= 4;
++	PAGE_SERVER	= 5;
++
++	NOTIFY		= 6;
++}
++
++/*
++ * Request -- each type corresponds to must-be-there
++ * request arguments of respective type
++ */
++
++message criu_req {
++	required criu_req_type		type		= 1;
++
++	optional criu_opts		opts		= 2;
++	optional bool			notify_success	= 3;
++}
++
++/*
++ * Responce -- it states whether the request was served
++ * and additional request-specific informarion
++ */
++
++message criu_resp {
++	required criu_req_type		type		= 1;
++	required bool			success		= 2;
++
++	optional criu_dump_resp		dump		= 3;
++	optional criu_restore_resp	restore		= 4;
++	optional criu_notify		notify		= 5;
++	optional criu_page_server_info	ps		= 6;
++}
+-- 
+1.9.1
+
+
+From ddd395e2928a885e5c60c77fa413cc4faea012be Mon Sep 17 00:00:00 2001
+From: Bala Chandrasekaran <balac@cs.duke.edu>
+Date: Sun, 20 Sep 2015 17:18:24 -0400
+Subject: [PATCH 6/6] Fix bug in cleanup code.
+
+---
+ cr-service.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/cr-service.c b/cr-service.c
+index c5bc17b..d4d97af 100644
+--- a/cr-service.c
++++ b/cr-service.c
+@@ -842,7 +842,7 @@ int run_chkpt_num_proc(int req_pipe[2], int res_pipe[2])
+ 
+                 while (beg_id >= end_id) {
+                     /* NOTE: Use path of last successful checkpoint. */
+-                    sprintf(clear_cmd, "sudo rm -rf %s/%lu", output_base_path, beg_id);
++                    sprintf(clear_cmd, "sudo rm -rf %s/%d/%lu", output_base_path, app_num, beg_id);
+ 
+                     ret = system(clear_cmd);
+ 
+-- 
+1.9.1
+
