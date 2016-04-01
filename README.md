@@ -1,95 +1,58 @@
-## About
+# LegoSDN
 
-LegoSDN is a re-design of the SDN controller architecture centering around a set of abstractions to eliminate the fate-sharing relationships (between the SDN-Apps and the controller, and between the SDN-Apps and the network), and make the controller and network resilient to SDN-App failures.
+[LegoSDN](http://legosdn.cs.duke.edu) is a re-design of the SDN controller architecture centering around a set of abstractions to eliminate the fate-sharing relationships (between the SDN-Apps and the controller, and between the SDN-Apps and the network), and make the controller and network resilient to SDN-App failures.
+
+You can learn more about the project at [http://legosdn.cs.duke.edu](http://legosdn.cs.duke.edu)
 
 
-## Installation
-
-The following tools are required to build and run the source code.
+## Prerequisites
 
 1. Oracle Java JDK/JRE (>=1.6)
-2. Apache ant
+2. Git
+3. Apache ant
+4. [Floodlight](http://www.projectfloodlight.org/floodlight/)
+5. [CRIU](http://www.criu.org)
 
-## Source
 
-The project source code and its dependencies are hosted on gitlab.cs.duke.edu and poseidon.cs.duke.edu. You can obtain the permissions to access the repository by emailing Theophilus Benson (<tbenson@cs.duke.edu>). Once you have the access, clone the repository as follows.
+## Getting the source code
 
-```
-$ git clone --recursive git@gitlab.cs.duke.edu:balac/legosdn.git
-```
-
-The base directory of the project should contain the following directories.
+Start by retrieving the source code of Floodlight and patching the build file of the project by following the instructions in `deps/dep-floodlight/README.md`. Install CRIU by following the instructions in `deps/dep-criu/README.md`. After installing Floodlight and CRIU, clone the LegoSDN repository on your machine.
 
 ```
-LEGOSDN_HOME
-├── build
-├── conf
-├── criu        # CRIU <submodule>
-├── dist
-├── docs
-├── ext
-├── sandbox
-├── src
-├── tests
-├── third-party
-└── tools
+$ git clone https://github.com/balakrishnanc/legosdn.git
 ```
 
-If the `criu` directory does not contain any files at this point, try the following.
+## Building
 
-```
-$ cd ${LEGOSDN_HOME}
-$ git submodule init
-$ git submodule update
-```
-
-Now, navigate to the `criu` directory and switch to `exp-1.3-stable` branch.
-
-```
-$ cd ${LEGOSDN_HOME}/criu
-$ git pull
-$ git checkout exp-1.3-stable
-```
-
-FloodLight sources can be pulled by cloning from the following repository, and to be compatible with LegoSDN switch to the `bleeding.edge` branch.
-
-```
-$ git clone ssh://safemodesdn@poseidon.cs.duke.edu:1106/var/yggdrasil/int/prj/floodlight
-$ git checkout bleeding.edge
-```
-
-## Build
-
-Set `JAVA_HOME` to point to the JDK/JRE installation path, and update the `PATH` variable as follows.
+Ensure that the following environment variables are set.
 
 ```
 export JAVA_HOME="/path/to/JDK-or-JRE"
 export PATH=${JAVA_HOME}/bin:${PATH}
+export FLOODLIGHT_HOME="/path/to/Floodlight"
+export CRIU_HOME="/path/to/CRIU"
+export LEGOSDN_HOME="/path/to/LegoSDN"
+export LEGOSDN_RT="/legosdn/runtime"
 ```
 
-Ensure that `LEGOSDN_HOME` and `FLOODLIGHT_HOME` are set to point to the paths where these two are installed.
-
-    export FLOODLIGHT_HOME="/path/to/FloodLight"
-    export LEGOSDN_HOME="/path/to/LegoSDN"
-
-The template file `template.bash_profile` can be used to create a `.bash_profile` to set the environment properly on login.
+The path indicated by the environment variable `LEGOSDN_RT` will be required for storing runtime data. This path can be created runtime setup scripts described in the next section. If you are using BASH shell, the template file `conf/template.bash_profile` can be used to create a `.bash_profile` to set the environment properly on login.
 
 ```
 $ cp -v conf/template.bash_profile ~/.bash_profile
-# and, edit the profile file accordingly.
+# Edit the profile file as required.
 ```
 
-You can build both FloodLight and LegoSDN using the scripts `build.sh` or `clean-build.sh`. The latter deletes any current build artifacts and rebuilds the source from scratch. Do not attempt the build it manually using ant and `build.xml` since there are circular dependencies.
+You can build both Floodlight and LegoSDN using the scripts `build.sh` or `clean-build.sh`. The latter deletes any current build artifacts and rebuilds the source from scratch. Do not attempt the build it manually using ant and `build.xml` since there are circular dependencies.
 
 ```
-$ cd $LEGOSDN_HOME
+$ cd ${LEGOSDN_HOME}
 $ ./clean-build.sh
 ```
 
 
-### Configuration
+## Configuration
 
-#### Runtime Configuration
+### Runtime Configuration
 
 LegoSDN requires the mountpoint `/legosdn` to be setup, and the script `tools/setup-mt-pts.sh` needs to be run (as root) to setup this mount point.
 
@@ -101,7 +64,7 @@ $ sudo ./tools/setup-mt-pts.sh
 Prior to running any of LegoSDN's components, please set the `LEGOSDN_RT` environment variable to point to a location where all runtime configuration data will be stored. The runtime location should ideally reside in a custom mount point at `/legosdn`. Please, take a look at the bash shell configuration template provided in `conf/template.bash_profile`. Note that the runtime path need not exist physically on disk or memory at this point. This path will be generated and populated with configuration data, once you run script `tools/gen-rt-deps.sh`. The script generates the required runtime directories and copies the configuration files.
 
 ```
-$ cd ${LEOSDN_HOME}
+$ cd ${LEGOSDN_HOME}
 $ ./tools/gen-rt-deps.sh
 ```
 
@@ -128,27 +91,27 @@ The following shows a sample listing of runtime configuration files; not all of 
 ```
 /legosdn/runtime/conf/
 ├── ctrlr-appv.properties
-├── edu.duke.cs.legosdn.tests.apps.flood.Flooder.properties
+├── edu.duke.cs.legosdn.tests.apps.hub.Hub.properties
 ├── edu.duke.cs.legosdn.tests.apps.rf.RouteFlow.properties
 └── logback.xml
 ```
 
 The file `ctrlr-appv.properties` contains settings to configure the behavior of the controller and AppVisor. The file `logback.xml` is used for configuring the level of logging in all components — Controller, AppVisor,  AppLoader, and Applications.
 
-Property files to customize the behavior of different applications are named after the canonical name of the application launcher class. For instance, the properties file for the application launcher class `edu.duke.cs.legosdn.tests.apps.flood.Flooder` is named `edu.duke.cs.legosdn.tests.apps.flood.Flooder.properties`. Note that the canonical name of the launcher is required to also launch the application from the command-line.
+Property files to customize the behavior of different applications are named after the canonical name of the application launcher class. For instance, the properties file for the application launcher class `edu.duke.cs.legosdn.tests.apps.hub.Hub` is named `edu.duke.cs.legosdn.tests.apps.hub.Hub.properties`. Note that the canonical name of the launcher is required to also launch the application from the command-line.
 
-#### FloodLight Configuration
+### Floodlight Configuration
 
-FloodLight also requires that the modules to be loaded by the controller be specified upfront, and hence, the FloodLight modules file should contain at least the following two entries.
+Floodlight also requires that the modules to be loaded by the controller be specified upfront, and hence, the Floodlight modules file should contain at least the following two entries.
 
 ```
 edu.duke.cs.legosdn.core.appvisor.proxy.AppProxy
 edu.duke.cs.legosdn.core.appvisor.proxy.AppAwareLinkDiscoveryManager
 ```
 
-The `AppProxy` class allows the applications to be started in isolated containers, and the `AppAwareLinkDiscoveryManager` class maintains per-app state related to links discovered in the network. The latter also requires that you disable the internal (bundled with FloodLight) `LinkDiscoveryManager` module by commenting it out (in the modules file). Modify the file further depending on what other modules or applications you intend to load.
+The `AppProxy` class allows the applications to be started in isolated containers, and the `AppAwareLinkDiscoveryManager` class maintains per-app state related to links discovered in the network. The latter also requires that you disable the internal (bundled with Floodlight) `LinkDiscoveryManager` module by commenting it out (in the modules file). Modify the file further depending on what other modules or applications you intend to load.
 
-#### AppVisor Configuration
+### AppVisor Configuration
 
 The sample properties file `ctrlr-appv.properties` to configure the controller and AppVisor is provided below.
 
@@ -206,7 +169,7 @@ edu.duke.cs.legosdn.tests.apps.rf.RouteFlow.host_to_sw_mappings=/legosdn/runtime
 
 The configuration parameters starting with `app.` are LegoSDN related. The first two identify the (main) application class and the port over which the controller can send data to the application for processing. The third parameter is optional and helps LegoSDN decide how to recover the application in the event of a crash. By default, applications are assumed to be stateless.
 
-Configuration parameters started with the canonical name of the application, `edu.duke.cs.legosdn.tests.apps.rf.RouteFlow` in this example, are parameters that the application is designed to accept. This is similar to how application specific configuration is passed via a properties when deploying the application over FloodLight; this makes porting an existing FloodLight application to LegoSDN much easier. The last two show configuration related to fault injectors--modules that generate faults to crash the application for testing.
+Configuration parameters started with the canonical name of the application, `edu.duke.cs.legosdn.tests.apps.rf.RouteFlow` in this example, are parameters that the application is designed to accept. This is similar to how application specific configuration is passed via a properties when deploying the application over Floodlight; this makes porting an existing Floodlight application to LegoSDN much easier. The last two show configuration related to fault injectors--modules that generate faults to crash the application for testing.
 
 ### Running
 
@@ -214,7 +177,7 @@ To run Floodlight with LegoSDN components start the following components in the 
 
 ```
 # Start CRIU
-$ cd ${LEGOSDN_HOME}/criu
+$ cd ${CRIU_HOME}
 $ ./launch-criu-tcp-service.sh
 
 # Start the controller with AppVisor
